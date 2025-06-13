@@ -61,12 +61,16 @@ export class OutboundCallManager {
       // Generate greeting with high priority
       await this.generateGreeting(callId);
 
+      // ИСПРАВЛЕНИЕ: убрать лишний слэш из serverUrl
+      const baseUrl = TWILIO_CONFIG.serverUrl.replace(/\/$/, ''); // Убираем слэш в конце
+      logger.info(`🔧 Using base URL: ${baseUrl}`); // Для отладки
+
       // Make call via Twilio
       const call = await twilioClient.calls.create({
         to: client.phone,
         from: TWILIO_CONFIG.phoneNumber,
-        url: `${TWILIO_CONFIG.serverUrl}/api/webhooks/twiml/${callId}`,
-        statusCallback: `${TWILIO_CONFIG.serverUrl}/api/webhooks/status/${callId}`,
+        url: `${baseUrl}/api/webhooks/twiml/${callId}`,
+        statusCallback: `${baseUrl}/api/webhooks/status/${callId}`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
         timeout: 60,
         record: false,
