@@ -1,7 +1,7 @@
-import { OpenAI } from "openai";
-import axios from "axios";
-import { CONFIG } from "../config/index.js";
-import { logger } from "../utils/logger.js";
+import { OpenAI } from 'openai';
+import axios from 'axios';
+import { CONFIG } from '../config/index.js';
+import { logger } from '../utils/logger.js';
 
 const openai = new OpenAI({ apiKey: CONFIG.OPENAI_API_KEY });
 
@@ -11,9 +11,9 @@ export class AIServices {
     try {
       const response = await openai.audio.transcriptions.create({
         file: audioBuffer,
-        model: "whisper-1",
-        language: "ru",
-        response_format: "json",
+        model: 'whisper-1',
+        language: 'ru',
+        response_format: 'json',
       });
 
       return {
@@ -22,7 +22,7 @@ export class AIServices {
         timestamp: Date.now(),
       };
     } catch (error) {
-      logger.error("STT Error:", error);
+      logger.error('STT Error:', error);
       throw new Error(`Speech recognition failed: ${error.message}`);
     }
   }
@@ -35,7 +35,7 @@ export class AIServices {
 
 Текущий этап: ${currentStage}
 Ответ должника: "${text}"
-История разговора: ${conversationHistory.slice(-3).join(" | ") || "начало"}
+История разговора: ${conversationHistory.slice(-3).join(' | ') || 'начало'}
 
 Классифицируй ответ как один из:
 - positive: согласие, готовность, "да", "хорошо", "договорились"
@@ -48,8 +48,8 @@ export class AIServices {
             `;
 
       const response = await openai.chat.completions.create({
-        model: "gpt-3.5-turbo",
-        messages: [{ role: "user", content: prompt }],
+        model: 'gpt-3.5-turbo',
+        messages: [{ role: 'user', content: prompt }],
         max_tokens: 10,
         temperature: 0.1,
       });
@@ -64,7 +64,7 @@ export class AIServices {
         timestamp: Date.now(),
       };
     } catch (error) {
-      logger.error("LLM Classification Error:", error);
+      logger.error('LLM Classification Error:', error);
       // Fallback to simple keyword classification
       return {
         classification: this.simpleClassify(text),
@@ -80,35 +80,35 @@ export class AIServices {
 
     // Aggressive keywords
     if (/блять|сука|пиздец|нахуй|отъебись/.test(lowerText)) {
-      return "aggressive";
+      return 'aggressive';
     }
 
     // Positive keywords
     if (/да|хорошо|согласен|договорились|заплачу|оплачу/.test(lowerText)) {
-      return "positive";
+      return 'positive';
     }
 
     // Negative keywords
     if (/нет|не буду|не могу|отказываюсь|денег нет/.test(lowerText)) {
-      return "negative";
+      return 'negative';
     }
 
     // Hang up keywords
     if (/до свидания|всего|кладу|отключаюсь/.test(lowerText)) {
-      return "hang_up";
+      return 'hang_up';
     }
 
-    return "neutral";
+    return 'neutral';
   }
 
   // Text-to-Speech
-  static async synthesizeSpeech(text, priority = "normal") {
+  static async synthesizeSpeech(text, priority = 'normal') {
     try {
       const response = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${CONFIG.TTS_VOICE_ID}`,
         {
           text: text,
-          model_id: "eleven_multilingual_v2",
+          model_id: 'eleven_multilingual_v2',
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.5,
@@ -118,11 +118,11 @@ export class AIServices {
         },
         {
           headers: {
-            Accept: "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": CONFIG.ELEVENLABS_API_KEY,
+            Accept: 'audio/mpeg',
+            'Content-Type': 'application/json',
+            'xi-api-key': CONFIG.ELEVENLABS_API_KEY,
           },
-          responseType: "arraybuffer",
+          responseType: 'arraybuffer',
           timeout: 30000,
         }
       );
@@ -133,7 +133,7 @@ export class AIServices {
         timestamp: Date.now(),
       };
     } catch (error) {
-      logger.error("TTS Error:", error);
+      logger.error('TTS Error:', error);
       throw new Error(`Speech synthesis failed: ${error.message}`);
     }
   }

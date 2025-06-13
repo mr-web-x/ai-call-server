@@ -3,7 +3,7 @@ export class DebtCollectionScripts {
     const scripts = {
       start: {
         positive: {
-          text: `Добрый день! Меня зовут Анна, я представляю компанию ${
+          text: `Добрый день! Меня зовут Ростик, я представляю компанию ${
             clientData.company || "Финанс-Сервис"
           }. Могу ли я говорить с ${clientData.name || "заемщиком"}?`,
           nextStage: "identification",
