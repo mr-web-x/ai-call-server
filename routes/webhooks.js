@@ -20,7 +20,7 @@ router.post('/twiml', async (req, res) => {
       ? 'present'
       : 'missing',
   });
-  logger.info(`📞 Request body:`, req.body);
+  // logger.info(`📞 Request body:`, req.body);
 
   try {
     // Verify this is a request from Twilio
@@ -132,7 +132,7 @@ router.post('/twiml/:callId', async (req, res) => {
   const { callId } = req.params;
 
   logger.info(`📞 TwiML requested for specific call: ${callId}`);
-  logger.info(`📞 Request body:`, req.body);
+  // logger.info(`📞 Request body:`, req.body);
 
   try {
     const twimlResponse = await outboundManager.generateTwiMLResponse(

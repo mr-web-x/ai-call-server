@@ -94,10 +94,10 @@ app.use((req, res, next) => {
 app.use('*', (req, res, next) => {
   console.log('=================================');
   console.log(`📡 INCOMING REQUEST: ${req.method} ${req.originalUrl}`);
-  console.log(`📍 IP: ${req.ip}`);
-  console.log(`🌐 User-Agent: ${req.get('User-Agent')}`);
-  console.log(`📋 Headers:`, Object.keys(req.headers));
-  console.log(`📦 Body:`, req.method === 'POST' ? req.body : 'N/A');
+  // console.log(`📍 IP: ${req.ip}`);
+  // console.log(`🌐 User-Agent: ${req.get('User-Agent')}`);
+  // console.log(`📋 Headers:`, Object.keys(req.headers));
+  // console.log(`📦 Body:`, req.method === 'POST' ? req.body : 'N/A');
   console.log('=================================');
   next();
 });
