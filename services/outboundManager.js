@@ -156,7 +156,7 @@ export class OutboundCallManager {
   /**
    * Handle TTS completion and store audio data
    */
-  onTTSCompleted(callId, audioData) {
+  handleTTSCompleted(callId, audioData) {
     logger.info(`🎯 TTS COMPLETED for call ${callId}:`, {
       source: audioData.source,
       hasAudioUrl: !audioData.audioUrl,
