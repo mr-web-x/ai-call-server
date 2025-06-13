@@ -11,10 +11,14 @@ const router = express.Router();
 // TWIML GENERATION WEBHOOK
 // =====================================================
 
+// В routes/webhooks.js - обновить TwiML endpoint с детальным логированием:
+
 router.post('/twiml/:callId', async (req, res) => {
   const { callId } = req.params;
 
   logger.info(`📞 TwiML requested for call: ${callId}`);
+  logger.info(`📞 Request headers:`, req.headers);
+  logger.info(`📞 Request body:`, req.body);
 
   try {
     // Generate TwiML response using OutboundManager
@@ -29,6 +33,31 @@ router.post('/twiml/:callId', async (req, res) => {
       res.send(outboundManager.generateErrorTwiML());
       return;
     }
+
+    // ЛОГИРОВАТЬ ТИП ОТВЕТА
+    if (twimlResponse.includes('<Play>')) {
+      logger.info(`🎵 Sending PLAY TwiML (ElevenLabs) for call: ${callId}`);
+      const urlMatch = twimlResponse.match(/<Play>(.*?)<\/Play>/);
+      if (urlMatch) {
+        logger.info(`🎵 Audio URL: ${urlMatch[1]}`);
+      }
+    } else if (twimlResponse.includes('<Say>')) {
+      logger.warn(`🔊 Sending SAY TwiML (Twilio fallback) for call: ${callId}`);
+      const voiceMatch = twimlResponse.match(/voice="([^"]+)"/);
+      if (voiceMatch) {
+        logger.info(`🔊 Voice: ${voiceMatch[1]}`);
+      }
+    } else if (twimlResponse.includes('<Redirect>')) {
+      logger.info(
+        `🔄 Sending REDIRECT TwiML (waiting for TTS) for call: ${callId}`
+      );
+    } else if (twimlResponse.includes('<Hangup>')) {
+      logger.info(`📴 Sending HANGUP TwiML (error) for call: ${callId}`);
+    }
+
+    // Логировать полный TwiML для отладки
+    logger.info(`📋 Full TwiML response for call ${callId}:`);
+    logger.info(twimlResponse);
 
     logger.info(`✅ TwiML generated for call: ${callId}`);
     res.type('text/xml');

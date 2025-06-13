@@ -4,6 +4,7 @@ import { ttsManager } from '../services/ttsManager.js';
 import { audioManager } from '../services/audioManager.js';
 import { outboundManager } from '../services/outboundManager.js';
 import { logger } from '../utils/logger.js';
+import { cacheManager } from '../services/cacheManager.js';
 
 // STT Queue Processor
 sttQueue.process('transcribe', 5, async (job) => {
@@ -52,15 +53,32 @@ ttsQueue.process('synthesize', 3, async (job) => {
 
   try {
     logger.info(
-      `Processing TTS for call: ${callId}, priority: ${priority}, type: ${type}`
+      `🎤 Processing TTS for call: ${callId}, priority: ${priority}, type: ${type}`
     );
 
-    // Use new TTS Manager
+    // Use TTS Manager
     const result = await ttsManager.synthesizeSpeech(text, {
       voiceId: voiceId,
       priority: priority,
       useCache: useCache,
     });
+
+    logger.info(
+      `🎯 TTS result for call ${callId}: source=${result.source}, hasAudio=${!!result.audioBuffer}`
+    );
+
+    // ВАЖНО: Кэшировать ТОЛЬКО если это новый ElevenLabs результат (не кэш!)
+    if (
+      result.source === 'elevenlabs' &&
+      result.audioBuffer &&
+      useCache &&
+      cacheManager.shouldCache(text)
+    ) {
+      logger.info(
+        `💾 Caching new ElevenLabs audio for: ${text.substring(0, 30)}...`
+      );
+      await cacheManager.setCachedAudio(text, result.audioBuffer, voiceId);
+    }
 
     // If we have an audio buffer (ElevenLabs), save it as a file
     if (result.audioBuffer) {
@@ -82,6 +100,21 @@ ttsQueue.process('synthesize', 3, async (job) => {
       };
     }
 
+    // Cache hit - return cached URL (НЕ КЭШИРОВАТЬ ПОВТОРНО!)
+    if (result.source === 'cache' && result.audioUrl) {
+      logger.info(`✅ Using cached ElevenLabs audio: ${result.audioUrl}`);
+      return {
+        callId,
+        text,
+        type,
+        audioUrl: result.audioUrl,
+        audioBuffer: null,
+        source: result.source,
+        voiceId: result.voiceId,
+        twilioTTS: false,
+      };
+    }
+
     // Twilio TTS fallback
     return {
       callId,
@@ -90,11 +123,11 @@ ttsQueue.process('synthesize', 3, async (job) => {
       audioUrl: null,
       audioBuffer: null,
       source: result.source,
-      voiceId: result.voiceId,
+      voiceId: result.voiceId || 'Polly.Tatyana', // Русский голос
       twilioTTS: true,
     };
   } catch (error) {
-    logger.error('TTS Processing Error:', error);
+    logger.error(`❌ TTS Processing Error for call ${callId}:`, error);
 
     // Ultimate fallback - return Twilio TTS instruction
     return {
@@ -104,7 +137,7 @@ ttsQueue.process('synthesize', 3, async (job) => {
       audioUrl: null,
       audioBuffer: null,
       source: 'error_fallback',
-      voiceId: 'alice',
+      voiceId: 'Polly.Tatyana', // РУССКИЙ голос для fallback
       twilioTTS: true,
       error: error.message,
     };
@@ -134,29 +167,24 @@ llmQueue.on('failed', (job, err) => {
 });
 
 // TTS Events - CRITICAL TTS COMPLETION HANDLER
-ttsQueue.on('completed', async (job, result) => {
-  const { callId, audioUrl, text, type, source } = result;
+ttsQueue.on('completed', (job, result) => {
+  logger.info(`✅ TTS job completed: ${job.id} for call: ${result.callId}`);
 
-  logger.info(
-    `✅ TTS job completed: ${job.id} for call: ${callId} (${source})`
-  );
+  // ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ РЕЗУЛЬТАТА
+  logger.info(`🎯 TTS Result Details:`, {
+    callId: result.callId,
+    source: result.source,
+    twilioTTS: result.twilioTTS,
+    hasAudioUrl: !!result.audioUrl,
+    type: result.type,
+  });
 
-  try {
-    // Notify OutboundCallManager that audio is ready
-    await outboundManager.handleTTSCompleted(callId, {
-      audioUrl,
-      text,
-      type,
-      source,
-      twilioTTS: result.twilioTTS,
-      voiceId: result.voiceId,
-    });
-
+  // Notify OutboundManager
+  if (result.callId) {
+    outboundManager.handleTTSCompleted(result.callId, result);
     logger.info(
-      `📢 TTS completion notified to OutboundManager for call: ${callId}`
+      `📢 TTS completion notified to OutboundManager for call: ${result.callId}`
     );
-  } catch (error) {
-    logger.error(`Failed to handle TTS completion for call ${callId}:`, error);
   }
 });
 

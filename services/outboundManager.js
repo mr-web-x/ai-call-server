@@ -141,6 +141,16 @@ export class OutboundCallManager {
       return;
     }
 
+    // ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ
+    logger.info(`🎯 TTS COMPLETED for call ${callId}:`, {
+      source: audioData.source,
+      hasAudioUrl: !!audioData.audioUrl,
+      hasAudioBuffer: !!audioData.audioBuffer,
+      twilioTTS: audioData.twilioTTS,
+      type: audioData.type,
+      voiceId: audioData.voiceId,
+    });
+
     // Store audio data for webhook
     this.pendingAudio.set(callId, {
       ...audioData,
@@ -149,13 +159,26 @@ export class OutboundCallManager {
     });
 
     logger.info(
-      `TTS completed for call ${callId}, audio ready: ${audioData.source}`
+      `✅ TTS completed for call ${callId}, audio ready: ${audioData.source}`
     );
 
-    // If this is a greeting and call is still in calling state, we're ready
+    // Уведомить о готовности
     if (audioData.type === 'greeting' && callData.status === 'calling') {
-      logger.info(`Greeting ready for call ${callId}`);
+      logger.info(
+        `🎉 Greeting ready for call ${callId} - ElevenLabs audio prepared!`
+      );
     }
+  }
+
+  /**
+   * Check if TTS is in progress for call
+   */
+  checkTTSInProgress(callId) {
+    const callData = this.activeCalls.get(callId);
+    if (!callData) return false;
+
+    // Проверить есть ли активное TTS задание
+    return callData.greetingJobId && !this.pendingAudio.get(callId);
   }
 
   /**
@@ -168,27 +191,48 @@ export class OutboundCallManager {
       return this.generateErrorTwiML();
     }
 
+    logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
+
     // Check for pending audio
     const audioData = this.pendingAudio.get(callId);
+    logger.info(`🎯 Checking pending audio for call: ${callId}`, {
+      hasPendingAudio: !!audioData,
+      consumed: audioData?.consumed,
+      source: audioData?.source,
+      hasAudioUrl: !!audioData?.audioUrl,
+      twilioTTS: audioData?.twilioTTS,
+    });
 
     if (audioData && !audioData.consumed) {
       // Mark as consumed
       audioData.consumed = true;
       this.pendingAudio.set(callId, audioData);
 
-      logger.info(`Using ${audioData.source} audio for call ${callId}`);
+      logger.info(`✅ Using ${audioData.source} audio for call ${callId}`);
 
-      if (audioData.audioUrl) {
+      if (audioData.audioUrl && !audioData.twilioTTS) {
         // Use ElevenLabs or cached audio
+        logger.info(
+          `🎵 Generating PLAY TwiML for ElevenLabs audio: ${audioData.audioUrl}`
+        );
         return this.generatePlayTwiML(callId, audioData.audioUrl);
       } else if (audioData.twilioTTS) {
         // Use Twilio TTS fallback
-        return this.generateSayTwiML(callId, audioData.text, audioData.voiceId);
+        logger.warn(`🔊 Generating SAY TwiML fallback for call: ${callId}`);
+        return this.generateSayTwiML(
+          callId,
+          audioData.text,
+          audioData.voiceId || 'Polly.Tatyana'
+        );
       }
     }
 
     // Fallback: generate basic TwiML while waiting for audio
     if (context === 'initial') {
+      logger.warn(
+        `⚠️ No audio ready for initial call: ${callId}, generating fallback`
+      );
+
       // First call - might be waiting for greeting
       const script = DebtCollectionScripts.getScript(
         'start',
@@ -196,17 +240,25 @@ export class OutboundCallManager {
         callData.session.clientData
       );
 
-      return this.generateSayTwiML(callId, script.text, 'alice');
+      logger.warn(`🔊 Using Twilio TTS fallback for greeting: ${callId}`);
+      return this.generateSayTwiML(callId, script.text, 'Polly.Tatyana');
     }
 
     // Default fallback
-    return this.generateSayTwiML(callId, 'Пожалуйста, подождите...', 'alice');
+    logger.warn(`⚠️ Default fallback for call: ${callId}`);
+    return this.generateSayTwiML(
+      callId,
+      'Пожалуйста, подождите...',
+      'Polly.Tatyana'
+    );
   }
 
   /**
    * Generate TwiML with Play tag (for ElevenLabs/cached audio)
    */
   generatePlayTwiML(callId, audioUrl) {
+    logger.info(`🎵 Generating Play TwiML for ElevenLabs audio: ${audioUrl}`);
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>${audioUrl}</Play>
@@ -225,7 +277,9 @@ export class OutboundCallManager {
   /**
    * Generate TwiML with Say tag (for Twilio TTS fallback)
    */
-  generateSayTwiML(callId, text, voice = 'alice') {
+  generateSayTwiML(callId, text, voice = 'Polly.Tatyana') {
+    logger.warn(`🔊 Generating Say TwiML fallback with voice: ${voice}`);
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="${voice}" language="ru-RU">${text}</Say>

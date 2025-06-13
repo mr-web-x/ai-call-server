@@ -33,6 +33,7 @@ const server = createServer(app);
 // ==============================================
 // MIDDLEWARE SETUP
 // ==============================================
+app.set('trust proxy', true);
 
 // Security middleware
 app.use(

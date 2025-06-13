@@ -23,44 +23,53 @@ export class TTSManager {
   /**
    * Main TTS synthesis method with fallback strategy
    */
+
   async synthesizeSpeech(text, options = {}) {
     const {
       voiceId = this.defaultVoiceId,
       priority = 'normal',
       useCache = true,
-      maxRetries = 2,
+      maxRetries = 3, // Увеличить попытки
     } = options;
 
     this.metrics.totalRequests++;
 
     logger.info(
-      `TTS Request: "${text.substring(0, 50)}..." (priority: ${priority})`
+      `🎤 TTS Request: "${text.substring(0, 50)}..." (priority: ${priority})`
     );
 
     try {
-      // Check cache first (if enabled)
+      // 1. Проверить кэш ПЕРВЫМ (если включен)
       if (useCache) {
         const cachedUrl = await cacheManager.getCachedAudio(text, voiceId);
         if (cachedUrl) {
           this.metrics.cacheHits++;
-          logger.info(`Using cached audio for: ${text.substring(0, 30)}...`);
+          logger.info(`✅ Cache HIT for: ${text.substring(0, 30)}...`);
           return {
-            audioBuffer: null, // No buffer needed for cached URLs
+            audioBuffer: null,
             audioUrl: cachedUrl,
             source: 'cache',
             text: text,
             voiceId: voiceId,
+            twilioTTS: false, // Кэш = ElevenLabs
           };
         }
         this.metrics.cacheMisses++;
+        logger.info(`❌ Cache MISS for: ${text.substring(0, 30)}...`);
       }
 
-      // Try ElevenLabs first
+      // 2. Попытаться ElevenLabs с несколькими попытками
+      logger.info(
+        `🎯 Attempting ElevenLabs TTS (max ${maxRetries} attempts)...`
+      );
+
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          logger.info(`🔄 ElevenLabs attempt ${attempt}/${maxRetries}...`);
+
           const result = await this.synthesizeWithElevenLabs(text, voiceId);
 
-          // Cache if it's a cacheable phrase
+          // Кэшировать успешный результат
           if (useCache && cacheManager.shouldCache(text)) {
             await cacheManager.setCachedAudio(
               text,
@@ -71,33 +80,36 @@ export class TTSManager {
 
           this.metrics.elevenLabsRequests++;
           logger.info(
-            `ElevenLabs TTS success (attempt ${attempt}): ${text.substring(0, 30)}...`
+            `✅ ElevenLabs SUCCESS (attempt ${attempt}): ${text.substring(0, 30)}...`
           );
 
           return {
             ...result,
             source: 'elevenlabs',
             attempt: attempt,
+            twilioTTS: false, // Это ElevenLabs!
           };
         } catch (error) {
-          logger.warn(`ElevenLabs attempt ${attempt} failed:`, error.message);
+          logger.warn(
+            `⚠️ ElevenLabs attempt ${attempt}/${maxRetries} failed:`,
+            error.message
+          );
 
           if (attempt === maxRetries) {
             this.metrics.elevenLabsErrors++;
-            throw error;
+            logger.error(`❌ ElevenLabs FAILED after ${maxRetries} attempts`);
+            break; // Выйти из цикла попыток
           }
 
-          // Wait before retry (exponential backoff)
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.pow(2, attempt) * 1000)
-          );
+          // Экспоненциальная задержка между попытками
+          const delay = Math.pow(2, attempt) * 1000;
+          logger.info(`⏳ Waiting ${delay}ms before retry...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
-    } catch (error) {
-      logger.error(
-        'ElevenLabs TTS failed, using Twilio fallback:',
-        error.message
-      );
+
+      // 3. ТОЛЬКО если ElevenLabs совсем не работает - fallback на Twilio
+      logger.error(`❌ ElevenLabs completely failed, using Twilio fallback`);
       this.metrics.twilioFallbacks++;
 
       return {
@@ -106,7 +118,21 @@ export class TTSManager {
         twilioTTS: true,
         source: 'twilio_fallback',
         text: text,
-        voiceId: 'alice', // Twilio voice
+        voiceId: 'Polly.Tatyana', // РУССКИЙ голос для fallback!
+        error: 'ElevenLabs failed after all attempts',
+      };
+    } catch (error) {
+      logger.error('Critical TTS Error:', error.message);
+      this.metrics.twilioFallbacks++;
+
+      // Критическая ошибка - fallback
+      return {
+        audioBuffer: null,
+        audioUrl: null,
+        twilioTTS: true,
+        source: 'error_fallback',
+        text: text,
+        voiceId: 'Polly.Tatyana', // РУССКИЙ голос
         error: error.message,
       };
     }
