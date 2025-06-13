@@ -272,15 +272,16 @@ export class OutboundCallManager {
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>${audioUrl}</Play>
-    <Record 
-        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
-        method="POST"
-        maxLength="300"
-        playBeep="false"
-        timeout="10"
-        finishOnKey="#"
-        recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
-    />
+<Record 
+    action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+    method="POST"
+    maxLength="60"       
+    playBeep="false"
+    timeout="3"          
+    finishOnKey="#"
+    trim="trim-silence"  
+    recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
+/>
 </Response>`;
   }
 
@@ -296,9 +297,10 @@ export class OutboundCallManager {
     <Record 
         action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
         method="POST"
-        maxLength="300"
+        maxLength="60"
         playBeep="false"
-        timeout="10"
+        timeout="3"
+        trim="trim-silence"  
         finishOnKey="#"
         recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
     />

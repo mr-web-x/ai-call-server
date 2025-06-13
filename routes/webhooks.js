@@ -192,12 +192,10 @@ router.post('/status/:callId', async (req, res) => {
     switch (CallStatus) {
       case 'answered':
         logger.info(`✅ Call answered: ${callId}`);
-        // Note: We don't call handleCallAnswered here because TwiML endpoint handles it
         break;
 
       case 'in-progress':
         logger.info(`📞 Call in progress: ${callId}`);
-        // Call is active, TwiML endpoint manages the conversation
         break;
 
       case 'completed':
@@ -206,9 +204,26 @@ router.post('/status/:callId', async (req, res) => {
       case 'failed':
       case 'canceled':
         logger.info(`📞 Call ended: ${callId} with status: ${CallStatus}`);
+
+        // 🔥 КЛЮЧОВЕ ВИПРАВЛЕННЯ: Збільшуємо затримку до 30 секунд
+        // щоб дати час recording webhook обробитись повністю
         setTimeout(() => {
-          outboundManager.endCall(callId, CallStatus);
-        }, 5000); // 5 секунд — дати час TTS завершити
+          const callData = outboundManager.getCallData(callId);
+
+          // Перевіряємо, чи є активні записи для обробки
+          if (callData && callData.processingRecording) {
+            logger.info(
+              `⏳ Delaying call cleanup for ${callId} - recording in progress`
+            );
+
+            // Додаткова затримка, якщо запис ще обробляється
+            setTimeout(() => {
+              outboundManager.endCall(callId, CallStatus);
+            }, 15000); // Ще 15 секунд
+          } else {
+            outboundManager.endCall(callId, CallStatus);
+          }
+        }, 30000); // 30 секунд замість 5
         break;
 
       case 'ringing':
@@ -245,9 +260,15 @@ router.post('/recording/:callId', async (req, res) => {
   });
 
   try {
+    // 🔥 МАРКУЄМО що запис обробляється
+    logger.info(`🎤 Start...`);
+
     // Check if call was hung up
     if (Digits === 'hangup') {
       logger.info(`📞 Call hung up during recording: ${callId}`);
+
+      // Прибираємо маркер обробки
+
       res.type('text/xml');
       res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -259,6 +280,9 @@ router.post('/recording/:callId', async (req, res) => {
     // Validate recording URL
     if (!RecordingUrl) {
       logger.warn(`❌ No recording URL provided for call: ${callId}`);
+
+      // Прибираємо маркер обробки
+
       res.type('text/xml');
       res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -266,9 +290,10 @@ router.post('/recording/:callId', async (req, res) => {
     <Record 
         action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
         method="POST"
-        maxLength="300"
+        maxLength="60"
         playBeep="false"
-        timeout="10"
+        timeout="3"
+        trim="trim-silence"
         finishOnKey="#"
     />
 </Response>`);
@@ -276,11 +301,15 @@ router.post('/recording/:callId', async (req, res) => {
     }
 
     // Process recording through OutboundManager
+    logger.info(`🧠 Starting AI processing for call: ${callId}`);
+
     const result = await outboundManager.processRecording(
       callId,
       RecordingUrl,
       RecordingDuration
     );
+
+    // 🔥 МАРКУЄМО що обробка завершена
 
     if (!result) {
       logger.warn(`❌ No processing result for call: ${callId}`);
@@ -314,6 +343,7 @@ router.post('/recording/:callId', async (req, res) => {
 </Response>`);
     } else if (result.response && result.nextStage !== 'completed') {
       // Continue conversation - redirect to wait for TTS completion
+      logger.info(`🔄 Continuing conversation for call: ${callId}`);
       res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Pause length="2"/>
@@ -331,21 +361,10 @@ router.post('/recording/:callId', async (req, res) => {
   } catch (error) {
     logger.error(`❌ Recording processing error for call ${callId}:`, error);
 
-    // Graceful error handling with retry option
+    // Прибираємо маркер обробки у випадку помилки
+
     res.type('text/xml');
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Tatyana" language="ru-RU">Произошла ошибка при обработке. Попробуем ещё раз.</Say>
-    <Pause length="1"/>
-    <Record 
-        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
-        method="POST"
-        maxLength="300"
-        playBeep="false"
-        timeout="10"
-        finishOnKey="#"
-    />
-</Response>`);
+    res.send(outboundManager.generateErrorTwiML());
   }
 });
 
