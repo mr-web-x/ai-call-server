@@ -1,3 +1,4 @@
+import fs from 'fs/promises'; // ⬅️ ДОБАВЛЕН ИМПОРТ fs
 import { v4 as uuidv4 } from 'uuid';
 import mongoose from 'mongoose';
 import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
@@ -5,6 +6,7 @@ import { Client } from '../models/Client.js';
 import { Call } from '../models/Call.js';
 import { CallSession } from './callSession.js';
 import { DebtCollectionScripts } from '../scripts/debtCollection.js';
+import { AIServices } from './aiServices.js'; // ⬅️ ИСПРАВЛЕН ИМПОРТ
 import { ttsQueue } from '../queues/setup.js';
 import { audioManager } from './audioManager.js';
 import { ttsManager } from './ttsManager.js';
@@ -34,6 +36,9 @@ export class OutboundCallManager {
         throw new Error('Client not found');
       }
 
+      logger.info(
+        `📞 Starting call initiation for client: ${clientId} (${client.name})`
+      );
       logger.info(`📞 Initiating call to ${client.name} (${client.phone})`);
 
       // Create call session
@@ -55,61 +60,81 @@ export class OutboundCallManager {
         currentStage: 'initial_greeting',
         twilioCallSid: null,
         greetingJobId: null,
+        conversation: [], // ⬅️ ДОБАВЛЕНО для хранения истории разговора
       });
+
+      // Generate greeting first
+      const greetingScript = DebtCollectionScripts.getScript(
+        'start',
+        'positive',
+        session.clientData
+      );
+
+      logger.info(`Greeting pre-generated for call: ${callId}`);
+
+      // Start TTS generation for greeting (urgent priority)
+      const greetingJob = await ttsQueue.add(
+        'synthesize',
+        {
+          text: greetingScript.text,
+          callId: callId,
+          priority: 'urgent',
+          type: 'greeting',
+          useCache: true,
+        },
+        {
+          priority: 1,
+          attempts: 3,
+        }
+      );
+
+      // Store greeting job ID
+      this.activeCalls.get(callId).greetingJobId = greetingJob.id;
 
       // Create database record
       const callRecord = new Call({
         call_id: callId,
         client_id: client._id,
+        phone: client.phone,
         status: 'initiated',
         start_time: new Date(),
+        greeting_script: greetingScript.text,
+        current_stage: 'initial_greeting',
       });
 
       await callRecord.save();
       logger.info(
-        `✅ Call record created in DB: ${callId} for client: ${client._id}`
+        `✅ Call record created in DB: ${callId} for client: ${clientId}`
       );
 
-      // Generate greeting BEFORE making the Twilio call
-      await this.generateGreeting(callId);
+      // Generate TwiML URL
+      const twimlUrl = `${process.env.SERVER_URL}/api/webhooks/twiml`;
+      logger.info(
+        `Generating greeting for call ${callId}: ${greetingScript.text.substring(0, 50)}...`
+      );
 
-      // Prepare Twilio call configuration
-      const baseUrl = TWILIO_CONFIG.serverUrl.replace(/\/$/, '');
-      logger.info(`🔧 Using base URL: ${baseUrl}`);
+      // Log base URL being used
+      logger.info(`🔧 Using base URL: ${process.env.SERVER_URL}`);
 
-      // ИСПРАВЛЕННЫЙ Twilio call с правильными statusCallbackEvent
+      // Initiate Twilio call
       const call = await twilioClient.calls.create({
-        to: client.phone,
         from: TWILIO_CONFIG.phoneNumber,
-        // URL берется из настроек номера в Twilio Console
-        // НО мы все равно передаем для fallback
-        url: `${baseUrl}/api/webhooks/twiml`,
-        method: 'POST',
-        // Status callback для отслеживания статуса
-        statusCallback: `${baseUrl}/api/webhooks/status/${callId}`,
-        statusCallbackMethod: 'POST',
-        // ИСПРАВЛЕНИЕ: только поддерживаемые события
+        to: client.phone,
+        url: twimlUrl,
+        statusCallback: `${process.env.SERVER_URL}/api/webhooks/status/${callId}`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        // Увеличиваем timeout до 60 секунд
-        timeout: 60,
-        // Отключаем автоматическую запись на уровне звонка
-        record: false,
-        // Fallback URL на случай ошибок
-        fallbackUrl: `${baseUrl}/api/webhooks/twiml`,
-        fallbackMethod: 'POST',
+        statusCallbackMethod: 'POST',
+        timeout: TWILIO_CONFIG.timeout,
+        record: TWILIO_CONFIG.recordCalls,
       });
 
       // Update call data with Twilio SID
-      const callData = this.activeCalls.get(callId);
-      callData.twilioCallSid = call.sid;
+      this.activeCalls.get(callId).twilioCallSid = call.sid;
 
-      // Update database record with Twilio SID
+      // Update database with Twilio SID
       await Call.findOneAndUpdate(
         { call_id: callId },
-        {
-          twilio_call_sid: call.sid,
-          status: 'calling',
-        }
+        { twilio_call_sid: call.sid }
       );
 
       logger.info(`✅ Call initiated: ${callId} -> Twilio SID: ${call.sid}`);
@@ -120,74 +145,21 @@ export class OutboundCallManager {
         twilioCallSid: call.sid,
         clientName: client.name,
         phone: client.phone,
-        status: 'calling',
-        twimlUrl: `${baseUrl}/api/webhooks/twiml`,
+        status: 'initiated',
       };
     } catch (error) {
-      logger.error('❌ Failed to initiate call:', error);
+      logger.error(`❌ Failed to initiate call for client ${clientId}:`, error);
       throw error;
     }
   }
 
   /**
-   * Generate greeting audio with high priority
+   * Handle TTS completion and store audio data
    */
-  async generateGreeting(callId) {
-    const callData = this.activeCalls.get(callId);
-    if (!callData) {
-      logger.warn(
-        `Cannot generate greeting: call data not found for ${callId}`
-      );
-      return;
-    }
-
-    // Get greeting script
-    const script = DebtCollectionScripts.getScript(
-      'start',
-      'positive',
-      callData.session.clientData
-    );
-
-    logger.info(
-      `Generating greeting for call ${callId}: ${script.text.substring(0, 50)}...`
-    );
-
-    // Add high priority TTS job
-    const ttsJob = await ttsQueue.add(
-      'synthesize',
-      {
-        text: script.text,
-        callId: callId,
-        priority: 'urgent',
-        type: 'greeting',
-        useCache: true,
-      },
-      {
-        priority: 1, // Highest priority
-        attempts: 3,
-      }
-    );
-
-    // Store job reference
-    callData.greetingJobId = ttsJob.id;
-
-    return { ttsJobId: ttsJob.id, script: script.text };
-  }
-
-  /**
-   * Handle TTS completion notification from queue processor
-   */
-  async handleTTSCompleted(callId, audioData) {
-    const callData = this.activeCalls.get(callId);
-    if (!callData) {
-      logger.warn(`TTS completed for unknown call: ${callId}`);
-      return;
-    }
-
-    // ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ
+  onTTSCompleted(callId, audioData) {
     logger.info(`🎯 TTS COMPLETED for call ${callId}:`, {
       source: audioData.source,
-      hasAudioUrl: !!audioData.audioUrl,
+      hasAudioUrl: !audioData.audioUrl,
       hasAudioBuffer: !!audioData.audioBuffer,
       twilioTTS: audioData.twilioTTS,
       type: audioData.type,
@@ -206,7 +178,10 @@ export class OutboundCallManager {
     );
 
     // Notify when greeting is ready
-    if (audioData.type === 'greeting' && callData.status === 'calling') {
+    if (
+      audioData.type === 'greeting' &&
+      this.activeCalls.get(callId)?.status === 'calling'
+    ) {
       logger.info(
         `🎉 Greeting ready for call ${callId} - ${audioData.source} audio prepared!`
       );
@@ -250,48 +225,41 @@ export class OutboundCallManager {
 
     logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
 
-    // Check for ready audio
+    // Check for ready audio first
     const audioData = this.pendingAudio.get(callId);
-
     if (audioData && !audioData.consumed) {
       logger.info(`🎵 Using ready audio for call: ${callId}`);
 
-      // Mark as consumed to prevent reuse
+      // Mark as consumed
       audioData.consumed = true;
       this.pendingAudio.set(callId, audioData);
 
+      // Generate appropriate TwiML based on audio type
       if (audioData.audioUrl) {
-        // Use ElevenLabs audio
         logger.info(`🎵 Sending ElevenLabs PLAY TwiML for call: ${callId}`);
         logger.info(`🎵 Audio URL: ${audioData.audioUrl}`);
         return this.generatePlayTwiML(callId, audioData.audioUrl);
-      } else if (audioData.twilioTTS) {
-        // Use Twilio TTS as fallback
-        logger.warn(`🔊 Using Twilio SAY TwiML fallback for call: ${callId}`);
-        return this.generateSayTwiML(callId, audioData.text, audioData.voiceId);
+      } else if (audioData.audioBuffer) {
+        // Should not happen as audioManager creates URLs
+        logger.warn(`⚠️ Audio buffer without URL for call: ${callId}`);
+        return this.generateSayTwiML(callId, 'Произошла ошибка со звуком');
       }
     }
 
-    // If TTS is still processing, redirect with pause
+    // Check if TTS is still processing
     if (this.checkTTSInProgress(callId)) {
-      logger.info(`⏳ TTS in progress for call: ${callId}, redirecting...`);
-      return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Pause length="2"/>
-    <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
-</Response>`;
+      logger.info(`⏳ TTS still in progress for call: ${callId}, redirecting`);
+      return this.generateRedirectTwiML(callId);
     }
 
-    // Fallback: generate simple greeting using Twilio TTS
-    logger.warn(
-      `🔄 No ready audio for call: ${callId}, using fallback greeting`
-    );
+    // Generate fallback TwiML
     const script = DebtCollectionScripts.getScript(
-      'start',
+      callData.currentStage || 'start',
       'positive',
-      callData.session.clientData || {}
+      callData.session.clientData
     );
 
+    logger.warn(`⚠️ No audio ready for call: ${callId}, using fallback TTS`);
     return this.generateSayTwiML(callId, script.text, 'Polly.Tatyana');
   }
 
@@ -334,6 +302,18 @@ export class OutboundCallManager {
         finishOnKey="#"
         recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
     />
+</Response>`;
+  }
+
+  /**
+   * Generate redirect TwiML (for waiting on TTS)
+   */
+  generateRedirectTwiML(callId) {
+    logger.info(`🔄 Generating redirect TwiML for call: ${callId}`);
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
 </Response>`;
   }
 
@@ -450,14 +430,55 @@ export class OutboundCallManager {
     logger.info(`🎤 Processing recording for call ${callId}: ${recordingUrl}`);
 
     try {
-      // Download and process audio with Twilio auth
+      // Wait a bit for Twilio to fully process the recording
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // Download and process audio with proper Twilio auth
+      const twilioAuth = Buffer.from(
+        `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+      ).toString('base64');
+
       const response = await fetch(recordingUrl, {
+        method: 'GET',
         headers: {
-          Authorization: `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`,
+          Authorization: `Basic ${twilioAuth}`,
+          'User-Agent': 'AI-Call-Backend/1.0',
+          Accept: 'audio/wav,audio/mpeg,audio/*',
         },
       });
 
       if (!response.ok) {
+        // If still 404, try to wait a bit more and retry once
+        if (response.status === 404) {
+          logger.warn(`⏰ Recording not ready yet, waiting 3 more seconds...`);
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+
+          const retryResponse = await fetch(recordingUrl, {
+            method: 'GET',
+            headers: {
+              Authorization: `Basic ${twilioAuth}`,
+              'User-Agent': 'AI-Call-Backend/1.0',
+              Accept: 'audio/wav,audio/mpeg,audio/*',
+            },
+          });
+
+          if (!retryResponse.ok) {
+            throw new Error(
+              `Failed to fetch recording after retry: ${retryResponse.status} ${retryResponse.statusText}`
+            );
+          }
+
+          const audioBuffer = Buffer.from(await retryResponse.arrayBuffer());
+          logger.info(
+            `✅ Recording downloaded on retry: ${audioBuffer.length} bytes`
+          );
+          return await this.processAudioBuffer(
+            callId,
+            audioBuffer,
+            recordingDuration
+          );
+        }
+
         throw new Error(
           `Failed to fetch recording: ${response.status} ${response.statusText}`
         );
@@ -466,46 +487,281 @@ export class OutboundCallManager {
       const audioBuffer = Buffer.from(await response.arrayBuffer());
       logger.info(`✅ Recording downloaded: ${audioBuffer.length} bytes`);
 
-      // Process through AI pipeline
-      const result = await callData.session.processAudioChunk(audioBuffer);
+      return await this.processAudioBuffer(
+        callId,
+        audioBuffer,
+        recordingDuration
+      );
+    } catch (error) {
+      logger.error(`❌ Recording processing failed for call ${callId}:`, error);
 
-      // Save recording to database
+      // Fallback: try to continue conversation without transcription
+      return this.handleRecordingError(callId, error);
+    }
+  }
+
+  /**
+   * Process audio buffer and generate AI response (с улучшенным логированием)
+   */
+  async processAudioBuffer(callId, audioBuffer, recordingDuration) {
+    const callData = this.activeCalls.get(callId);
+
+    try {
+      // Ensure recordings directory exists
+      const recordingsDir = './public/audio/recordings';
+      await fs.mkdir(recordingsDir, { recursive: true });
+
+      // Save audio for debugging with more info
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const audioPath = `${recordingsDir}/${callId}_${timestamp}.wav`;
+      await fs.writeFile(audioPath, audioBuffer);
+
+      logger.info(`🎵 Audio saved for debugging: ${audioPath}`, {
+        callId,
+        audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
+        duration: `${recordingDuration}s`,
+        timestamp,
+      });
+
+      // Transcribe with AIServices (исправлено!)
+      logger.info(`🎧 Starting transcription for call ${callId}...`);
+      const transcriptionStart = Date.now();
+
+      // Используем AIServices вместо openaiManager
+      const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
+      const transcription = transcriptionResult.text; // Извлекаем текст из результата
+
+      const transcriptionTime = Date.now() - transcriptionStart;
+
+      // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ТРАНСКРИПЦИИ
+      logger.info(`🎯 TRANSCRIPTION RESULT for call ${callId}:`, {
+        text: transcription,
+        audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
+        duration: `${recordingDuration}s`,
+        transcriptionTime: `${transcriptionTime}ms`,
+        charCount: transcription?.length || 0,
+        wordCount: transcription?.split(' ').length || 0,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Дополнительный лог для консоли (хорошо видно)
+      console.log('='.repeat(60));
+      console.log(`🗣️  СОБЕСЕДНИК СКАЗАЛ (${callId}):`);
+      console.log(`📝  "${transcription}"`);
+      console.log(
+        `⏱️  Длительность: ${recordingDuration}s | Размер: ${(audioBuffer.length / 1024).toFixed(1)} KB`
+      );
+      console.log(`🕐  ${new Date().toLocaleString('ru-RU')}`);
+      console.log('='.repeat(60));
+
+      if (!transcription || transcription.trim().length === 0) {
+        logger.warn(`⚠️ Empty transcription for call ${callId}`, {
+          audioSize: audioBuffer.length,
+          duration: recordingDuration,
+          audioPath,
+        });
+        return this.handleEmptyTranscription(callId);
+      }
+
+      // Проверка на подозрительную транскрипцию
+      if (transcription.length < 3) {
+        logger.warn(
+          `⚠️ Very short transcription for call ${callId}: "${transcription}"`,
+          {
+            charCount: transcription.length,
+            possibleIssue: 'Low audio quality or silence',
+          }
+        );
+      }
+
+      // Update call data with transcription
+      callData.conversation.push({
+        role: 'user',
+        content: transcription,
+        timestamp: new Date(),
+        duration: recordingDuration,
+        audioInfo: {
+          size: audioBuffer.length,
+          path: audioPath,
+          transcriptionTime,
+        },
+      });
+
+      // Classify user response and generate AI reply
+      logger.info(
+        `🔍 Classifying response for call ${callId}: "${transcription.substring(0, 50)}..."`
+      );
+
+      const classification =
+        DebtCollectionScripts.classifyResponse(transcription);
+
+      logger.info(`📊 Classification result for call ${callId}:`, {
+        text: transcription,
+        classification,
+        confidence: 'high', // можно добавить confidence из classifier
+      });
+
+      // Generate simple AI response (вместо openaiManager)
+      const aiResponse = {
+        text: this.generateSimpleResponse(classification, transcription),
+        nextStage: this.determineNextStage(classification),
+      };
+
+      // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ AI ОТВЕТА
+      logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
+        userInput: transcription,
+        classification,
+        aiResponse: aiResponse.text,
+        nextStage: aiResponse.nextStage,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Дополнительный лог для консоли AI ответа
+      console.log('🤖 AI ОТВЕЧАЕТ:');
+      console.log(`💬 "${aiResponse.text}"`);
+      console.log(
+        `🏷️  Классификация: ${classification} | Следующий этап: ${aiResponse.nextStage}`
+      );
+      console.log('-'.repeat(60));
+
+      // Add AI response to conversation
+      callData.conversation.push({
+        role: 'assistant',
+        content: aiResponse.text,
+        timestamp: new Date(),
+        classification: classification,
+        nextStage: aiResponse.nextStage,
+      });
+
+      // Generate TTS for response
+      if (aiResponse.text && aiResponse.nextStage !== 'completed') {
+        logger.info(
+          `🎤 Generating TTS for AI response: "${aiResponse.text.substring(0, 30)}..."`
+        );
+        await this.generateResponseTTS(callId, aiResponse.text, 'normal');
+      }
+
+      // Update database with detailed conversation log
       await Call.findOneAndUpdate(
         { call_id: callId },
         {
           $push: {
-            recordings: {
-              url: recordingUrl,
-              duration: parseInt(recordingDuration) || 0,
-              transcription: result.transcription,
-              classification: result.classification,
+            conversation: {
+              user_message: transcription,
+              ai_response: aiResponse.text,
+              classification: classification,
+              timestamp: new Date(),
+              metadata: {
+                audio_size: audioBuffer.length,
+                audio_duration: recordingDuration,
+                transcription_time: transcriptionTime,
+                audio_path: audioPath,
+              },
             },
           },
+          current_stage: aiResponse.nextStage || callData.session.currentStage,
+          last_transcription: transcription,
+          last_classification: classification,
         }
       );
 
-      logger.info(
-        `✅ Recording processed for call ${callId}: ${result.classification}`
-      );
-
-      // If conversation should continue, generate response TTS
-      if (result.response && result.nextStage !== 'completed') {
-        await this.generateResponseTTS(callId, result.response, 'normal');
-      }
-
-      return result;
-    } catch (error) {
-      logger.error(`❌ Failed to process recording for call ${callId}:`, error);
-
-      // Return graceful error response
       return {
-        transcription: '',
-        classification: 'error',
-        response: 'Извините, произошла ошибка при обработке. До свидания.',
-        nextStage: 'completed',
-        error: error.message,
+        transcription,
+        classification,
+        response: aiResponse.text,
+        nextStage: aiResponse.nextStage,
       };
+    } catch (error) {
+      logger.error(`❌ Audio processing failed for call ${callId}:`, {
+        error: error.message,
+        stack: error.stack,
+        audioSize: audioBuffer?.length || 'unknown',
+        duration: recordingDuration,
+      });
+      return this.handleRecordingError(callId, error);
     }
+  }
+
+  /**
+   * Генерирует простой ответ на основе классификации
+   */
+  generateSimpleResponse(classification, userInput) {
+    const responses = {
+      positive: 'Отлично! Давайте обсудим детали погашения долга.',
+      negative: 'Понимаю ваше положение. Давайте найдем компромиссное решение.',
+      neutral:
+        'Не могли бы вы уточнить свою позицию по погашению задолженности?',
+      aggressive:
+        'Прошу вас сохранять спокойствие. Мы можем решить этот вопрос мирно.',
+      hang_up: 'Спасибо за разговор. До свидания.',
+    };
+
+    return (
+      responses[classification] ||
+      'Не могли бы вы повторить? Я не совсем понял.'
+    );
+  }
+
+  /**
+   * Определяет следующий этап разговора
+   */
+  determineNextStage(classification) {
+    switch (classification) {
+      case 'positive':
+        return 'agreement';
+      case 'hang_up':
+        return 'completed';
+      case 'aggressive':
+        return 'de-escalation';
+      default:
+        return 'listening';
+    }
+  }
+
+  /**
+   * Handle recording processing errors gracefully
+   */
+  handleRecordingError(callId, error) {
+    logger.warn(
+      `⚠️ Using fallback response for call ${callId} due to error:`,
+      error.message
+    );
+
+    // Return a generic continuation response
+    const fallbackResponse =
+      'Извините, я не расслышал. Не могли бы вы повторить?';
+
+    // Generate TTS for fallback
+    this.generateResponseTTS(callId, fallbackResponse, 'urgent');
+
+    return {
+      transcription: '[ERROR: Could not process audio]',
+      classification: 'unclear',
+      response: fallbackResponse,
+      nextStage: 'listening',
+      error: true,
+    };
+  }
+
+  /**
+   * Handle empty transcriptions
+   */
+  handleEmptyTranscription(callId) {
+    logger.warn(
+      `⚠️ Empty transcription for call ${callId}, prompting for repeat`
+    );
+
+    const promptResponse = 'Я вас не слышу. Говорите пожалуйста громче.';
+
+    // Generate TTS for prompt
+    this.generateResponseTTS(callId, promptResponse, 'urgent');
+
+    return {
+      transcription: '[EMPTY]',
+      classification: 'silence',
+      response: promptResponse,
+      nextStage: 'listening',
+    };
   }
 
   /**

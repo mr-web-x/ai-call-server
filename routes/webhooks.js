@@ -234,14 +234,45 @@ router.post('/status/:callId', async (req, res) => {
 
 router.post('/recording/:callId', async (req, res) => {
   const { callId } = req.params;
-  const { RecordingUrl, RecordingDuration } = req.body;
+  const { RecordingUrl, RecordingDuration, Digits } = req.body;
 
   logger.info(`🎤 Recording received for call: ${callId}`, {
     url: RecordingUrl,
     duration: RecordingDuration,
+    digits: Digits,
   });
 
   try {
+    // Check if call was hung up
+    if (Digits === 'hangup') {
+      logger.info(`📞 Call hung up during recording: ${callId}`);
+      res.type('text/xml');
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Hangup/>
+</Response>`);
+      return;
+    }
+
+    // Validate recording URL
+    if (!RecordingUrl) {
+      logger.warn(`❌ No recording URL provided for call: ${callId}`);
+      res.type('text/xml');
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Tatyana" language="ru-RU">Не удалось получить запись. Попробуйте ещё раз.</Say>
+    <Record 
+        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+        method="POST"
+        maxLength="300"
+        playBeep="false"
+        timeout="10"
+        finishOnKey="#"
+    />
+</Response>`);
+      return;
+    }
+
     // Process recording through OutboundManager
     const result = await outboundManager.processRecording(
       callId,
@@ -263,7 +294,23 @@ router.post('/recording/:callId', async (req, res) => {
     // Generate next TwiML response
     res.type('text/xml');
 
-    if (result.response && result.nextStage !== 'completed') {
+    if (result.error) {
+      // Error occurred, but we have a fallback response
+      logger.warn(`⚠️ Using error fallback for call: ${callId}`);
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="1"/>
+    <Say voice="Polly.Tatyana" language="ru-RU">${result.response}</Say>
+    <Record 
+        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+        method="POST"
+        maxLength="300"
+        playBeep="false"
+        timeout="10"
+        finishOnKey="#"
+    />
+</Response>`);
+    } else if (result.response && result.nextStage !== 'completed') {
       // Continue conversation - redirect to wait for TTS completion
       res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -282,12 +329,20 @@ router.post('/recording/:callId', async (req, res) => {
   } catch (error) {
     logger.error(`❌ Recording processing error for call ${callId}:`, error);
 
-    // Graceful error handling
+    // Graceful error handling with retry option
     res.type('text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Tatyana" language="ru-RU">Произошла ошибка при обработке. До свидания.</Say>
-    <Hangup/>
+    <Say voice="Polly.Tatyana" language="ru-RU">Произошла ошибка при обработке. Попробуем ещё раз.</Say>
+    <Pause length="1"/>
+    <Record 
+        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+        method="POST"
+        maxLength="300"
+        playBeep="false"
+        timeout="10"
+        finishOnKey="#"
+    />
 </Response>`);
   }
 });
