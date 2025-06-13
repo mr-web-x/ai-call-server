@@ -336,8 +336,9 @@ export class OutboundCallManager {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
       logger.warn(
-        `Cannot generate response TTS: call data not found for ${callId}`
+        `⚠️ callData не найден для ${callId}, но продолжаем — возможно call уже завершён, генерируем финальный ответ`
       );
+      // Альтернатива: можеш зберігати відповідь у базу або чергу
       return;
     }
 
@@ -531,6 +532,8 @@ export class OutboundCallManager {
       const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
       const transcription = transcriptionResult.text; // Извлекаем текст из результата
 
+      logger.info(`🗣️ Клиент сказал (транскрипция): "${transcription}"`);
+
       const transcriptionTime = Date.now() - transcriptionStart;
 
       // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ТРАНСКРИПЦИИ
@@ -593,7 +596,13 @@ export class OutboundCallManager {
       );
 
       const classification =
-        DebtCollectionScripts.classifyResponse(transcription);
+        (
+          await AIServices.classifyResponse(
+            transcription,
+            callData.currentStage,
+            callData.conversation.map((c) => c.content)
+          )
+        )?.classification || 'neutral';
 
       logger.info(`📊 Classification result for call ${callId}:`, {
         text: transcription,
@@ -606,6 +615,8 @@ export class OutboundCallManager {
         text: this.generateSimpleResponse(classification, transcription),
         nextStage: this.determineNextStage(classification),
       };
+
+      logger.info(`🤖 AI ответил: "${aiResponse.text}"`);
 
       // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ AI ОТВЕТА
       logger.info(`🤖 AI RESPONSE for call ${callId}:`, {

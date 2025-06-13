@@ -206,7 +206,9 @@ router.post('/status/:callId', async (req, res) => {
       case 'failed':
       case 'canceled':
         logger.info(`📞 Call ended: ${callId} with status: ${CallStatus}`);
-        await outboundManager.endCall(callId, CallStatus);
+        setTimeout(() => {
+          outboundManager.endCall(callId, CallStatus);
+        }, 5000); // 5 секунд — дати час TTS завершити
         break;
 
       case 'ringing':
