@@ -33,7 +33,7 @@ const server = createServer(app);
 // ==============================================
 // MIDDLEWARE SETUP
 // ==============================================
-app.set('trust proxy', true);
+app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
 
 // Security middleware
 app.use(
@@ -62,6 +62,13 @@ const limiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    // Пропускаем webhooks от Twilio
+    return (
+      req.path.startsWith('/api/webhooks') ||
+      req.headers['user-agent']?.includes('TwilioProxy')
+    );
+  },
 });
 
 app.use('/api/', limiter);
@@ -83,6 +90,17 @@ app.use((req, res, next) => {
 // ==============================================
 // STATIC FILE SERVING
 // ==============================================
+
+app.use('*', (req, res, next) => {
+  console.log('=================================');
+  console.log(`📡 INCOMING REQUEST: ${req.method} ${req.originalUrl}`);
+  console.log(`📍 IP: ${req.ip}`);
+  console.log(`🌐 User-Agent: ${req.get('User-Agent')}`);
+  console.log(`📋 Headers:`, Object.keys(req.headers));
+  console.log(`📦 Body:`, req.method === 'POST' ? req.body : 'N/A');
+  console.log('=================================');
+  next();
+});
 
 // Serve audio files (critical for ElevenLabs integration)
 app.use(
