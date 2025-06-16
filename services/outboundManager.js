@@ -383,6 +383,9 @@ export class OutboundManager {
   /**
    * Обработка записи разговора
    */
+  /**
+   * Обработка записи разговора
+   */
   async processRecording(callId, recordingUrl, recordingDuration) {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
@@ -415,11 +418,33 @@ export class OutboundManager {
         throw new Error('Failed to download or empty audio buffer');
       }
 
-      const audioPath = await audioManager.saveRecordingForDebug(
-        callId,
-        audioBuffer,
-        recordingDuration
-      );
+      // 🔥 ИСПРАВЛЕНО: Безопасное сохранение аудио для отладки
+      let audioPath = null;
+      try {
+        // Сохраняем аудио для отладки (опционально)
+        if (
+          audioManager.saveRecordingForDebug &&
+          typeof audioManager.saveRecordingForDebug === 'function'
+        ) {
+          audioPath = await audioManager.saveRecordingForDebug(
+            callId,
+            audioBuffer,
+            recordingDuration
+          );
+        } else {
+          // Фолбэк - используем обычное сохранение
+          const audioFile = await audioManager.saveAudioFile(
+            callId,
+            audioBuffer,
+            'recording'
+          );
+          audioPath = audioFile.filepath;
+        }
+        logger.info(`💾 Audio saved for debug: ${audioPath}`);
+      } catch (saveError) {
+        logger.warn(`⚠️ Failed to save audio for debug: ${saveError.message}`);
+        audioPath = null; // Не критично, продолжаем обработку
+      }
 
       // Транскрибируем аудио
       const transcriptionStart = Date.now();
@@ -498,7 +523,6 @@ export class OutboundManager {
       logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
         userInput: transcription,
         classification,
-        aiResponse: responseResult.text,
         nextStage: responseResult.nextStage,
         timestamp: new Date().toISOString(),
       });
@@ -553,7 +577,7 @@ export class OutboundManager {
                 audio_size: audioBuffer.length,
                 audio_duration: recordingDuration,
                 transcription_time: transcriptionTime,
-                audio_path: audioPath,
+                audio_path: audioPath, // Может быть null - это нормально
               },
             },
           },
@@ -564,7 +588,6 @@ export class OutboundManager {
         }
       );
 
-      logger.info(`✅ Removed processing marker for call: ${callId}`);
       logger.info(
         `✅ Recording processed for call: ${callId} - ${classification}`
       );
@@ -582,12 +605,15 @@ export class OutboundManager {
       logger.error(`❌ Audio processing failed for call ${callId}:`, {
         error: error.message,
         stack: error.stack,
-        audioSize: audioBuffer?.length || 'unknown',
+        audioSize: audioBuffer?.length || 'unknown', // 🔥 ИСПРАВЛЕНО: добавлен ?.
         duration: recordingDuration,
+        errorType: error.constructor.name,
       });
       return this.handleRecordingError(callId, error);
     } finally {
+      // 🔥 ВСЕГДА удаляем маркер в finally блоке
       this.recordingProcessing.delete(callId);
+      logger.info(`✅ Removed processing marker for call: ${callId}`);
     }
   }
 
@@ -709,8 +735,8 @@ export class OutboundManager {
             },
             timeout: 30000,
             auth: {
-              username: CONFIG.TWILIO_ACCOUNT_SID,
-              password: CONFIG.TWILIO_AUTH_TOKEN,
+              username: process.env.TWILIO_ACCOUNT_SID,
+              password: process.env.TWILIO_AUTH_TOKEN,
             },
           });
 
@@ -843,14 +869,14 @@ export class OutboundManager {
 <Response>
     <Play>${audioUrl}</Play>
 <Record 
-    action="${CONFIG.SERVER_URL}/api/webhooks/recording/${callId}"
+    action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
     method="POST"
     maxLength="60"       
     playBeep="false"
     timeout="3"          
     finishOnKey="#"
     trim="trim-silence"  
-    recordingStatusCallback="${CONFIG.SERVER_URL}/api/webhooks/recording-status/${callId}"
+    recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
 />
 </Response>`;
 
@@ -870,14 +896,14 @@ export class OutboundManager {
 <Response>
     <Say voice="${voice}" language="ru-RU">${text}</Say>
     <Record 
-        action="${CONFIG.SERVER_URL}/api/webhooks/recording/${callId}"
+        action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
         method="POST"
         maxLength="60"
         playBeep="false"
         timeout="3"
         trim="trim-silence"  
         finishOnKey="#"
-        recordingStatusCallback="${CONFIG.SERVER_URL}/api/webhooks/recording-status/${callId}"
+        recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
     />
 </Response>`;
 
@@ -1209,6 +1235,21 @@ export class OutboundManager {
     }
 
     return stats;
+  }
+
+  isRecordingProcessing(callId) {
+    return this.recordingProcessing.has(callId);
+  }
+
+  // Установить маркер обработки записи
+  setRecordingProcessing(callId, processing = true) {
+    if (processing) {
+      this.recordingProcessing.set(callId, true);
+      logger.info(`🎤 Marked recording as processing for call: ${callId}`);
+    } else {
+      this.recordingProcessing.delete(callId);
+      logger.info(`✅ Removed processing marker for call: ${callId}`);
+    }
   }
 
   /**
