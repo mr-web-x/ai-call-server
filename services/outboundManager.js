@@ -1,166 +1,234 @@
-import fs from 'fs/promises'; // ⬅️ ДОБАВЛЕН ИМПОРТ fs
-import { v4 as uuidv4 } from 'uuid';
-import mongoose from 'mongoose';
-import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
-import { Client } from '../models/Client.js';
-import { Call } from '../models/Call.js';
 import { CallSession } from './callSession.js';
+import { AIServices } from './aiServices.js';
+import { responseGenerator } from './responseGenerator.js';
 import { DebtCollectionScripts } from '../scripts/debtCollection.js';
-import { AIServices } from './aiServices.js'; // ⬅️ ИСПРАВЛЕН ИМПОРТ
-import { ttsQueue } from '../queues/setup.js';
-import { audioManager } from './audioManager.js';
 import { ttsManager } from './ttsManager.js';
+import { audioManager } from './audioManager.js';
+import { Call } from '../models/Call.js';
+import { Client } from '../models/Client.js';
 import { logger } from '../utils/logger.js';
+import { CONFIG } from '../config/index.js';
 
-export class OutboundCallManager {
+// 🔧 ИСПРАВЛЕНИЕ: Используем ваш существующий Twilio конфиг
+import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
+
+import axios from 'axios';
+
+export class OutboundManager {
   constructor() {
-    this.activeCalls = new Map();
-    this.callQueue = [];
+    this.activeCalls = new Map(); // callId -> callData
     this.pendingAudio = new Map(); // callId -> audioData
+    this.recordingProcessing = new Map(); // callId -> boolean
+    this.classificationTracker = new Map(); // callId -> { classification -> count }
+    this.gptFailureCounter = new Map(); // callId -> failureCount
+
+    // 🔧 ИСПРАВЛЕНИЕ: Используем уже созданный twilioClient
+    this.twilioClient = twilioClient;
+
     logger.info('🏗️ OutboundCallManager initialized');
   }
 
   /**
-   * Initiate a new outbound call
+   * Инициировать исходящий звонок
    */
   async initiateCall(clientId) {
     try {
-      // Validate ObjectId
-      if (!mongoose.Types.ObjectId.isValid(clientId)) {
-        throw new Error('Invalid client ID');
+      // 🔍 ОТЛАДКА: Логируем настройки из вашего конфига
+      logger.info('🔍 Twilio Configuration Debug:', {
+        TWILIO_PHONE_NUMBER: TWILIO_CONFIG.phoneNumber
+          ? TWILIO_CONFIG.phoneNumber
+          : 'UNDEFINED',
+        SERVER_URL: TWILIO_CONFIG.serverUrl || CONFIG.SERVER_URL,
+        TIMEOUT: TWILIO_CONFIG.timeout,
+      });
+
+      // 🔧 ИСПРАВЛЕНИЕ: Проверяем настройки из TWILIO_CONFIG
+      if (!TWILIO_CONFIG.phoneNumber) {
+        throw new Error(
+          'TWILIO_PHONE_NUMBER is missing in TWILIO_CONFIG - проверьте .env файл!'
+        );
       }
 
-      // Get client from MongoDB
+      // Получаем данные клиента
       const client = await Client.findById(clientId);
       if (!client) {
-        throw new Error('Client not found');
+        throw new Error(`Client not found: ${clientId}`);
       }
+
+      const callId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
       logger.info(
         `📞 Starting call initiation for client: ${clientId} (${client.name})`
       );
-      logger.info(`📞 Initiating call to ${client.name} (${client.phone})`);
 
-      // Create call session
-      const callId = uuidv4();
+      // Создаём сессию звонка
       const session = new CallSession(callId, {
         name: client.name,
+        phone: client.phone,
         amount: client.debt_amount,
         contract: client.contract_number,
-        company: 'Финанс-Групп',
+        company: client.company || 'Финанс-Сервис',
       });
 
-      // Store active call data
-      this.activeCalls.set(callId, {
+      // Инициализируем данные звонка
+      const callData = {
+        callId,
+        twilioSid: null,
+        status: 'initiating',
+        clientId,
         session,
-        clientId: client._id,
-        phone: client.phone,
-        startTime: new Date(),
-        status: 'calling',
-        currentStage: 'initial_greeting',
+        conversation: [],
+        currentStage: 'start',
+        startTime: Date.now(),
+        recordingCount: 0,
+        lastActivity: Date.now(),
+        // 🔧 ДОБАВЛЯЕМ: Для совместимости с первым файлом
         twilioCallSid: null,
-        greetingJobId: null,
-        conversation: [], // ⬅️ ДОБАВЛЕНО для хранения истории разговора
-        processingRecording: true,
-      });
-
-      // Generate greeting first
-      const greetingScript = DebtCollectionScripts.getScript(
-        'start',
-        'positive',
-        session.clientData
-      );
-
-      logger.info(`Greeting pre-generated for call: ${callId}`);
-
-      // Start TTS generation for greeting (urgent priority)
-      const greetingJob = await ttsQueue.add(
-        'synthesize',
-        {
-          text: greetingScript.text,
-          callId: callId,
-          priority: 'urgent',
-          type: 'greeting',
-          useCache: true,
-        },
-        {
-          priority: 1,
-          attempts: 3,
-        }
-      );
-
-      // Store greeting job ID
-      this.activeCalls.get(callId).greetingJobId = greetingJob.id;
-
-      // Create database record
-      const callRecord = new Call({
-        call_id: callId,
-        client_id: client._id,
         phone: client.phone,
-        status: 'initiated',
-        start_time: new Date(),
-        greeting_script: greetingScript.text,
-        current_stage: 'initial_greeting',
-      });
+        greetingJobId: null,
+        processingRecording: false,
+      };
 
-      await callRecord.save();
-      logger.info(
-        `✅ Call record created in DB: ${callId} for client: ${clientId}`
-      );
+      this.activeCalls.set(callId, callData);
 
-      // Generate TwiML URL
-      const twimlUrl = `${process.env.SERVER_URL}/api/webhooks/twiml`;
-      logger.info(
-        `Generating greeting for call ${callId}: ${greetingScript.text.substring(0, 50)}...`
-      );
+      // Инициализируем трекер классификаций
+      this.classificationTracker.set(callId, {});
+      this.gptFailureCounter.set(callId, 0);
 
-      // Log base URL being used
-      logger.info(`🔧 Using base URL: ${process.env.SERVER_URL}`);
+      // Предгенерируем приветствие
+      await this.preGenerateGreeting(callId);
 
-      // Initiate Twilio call
-      const call = await twilioClient.calls.create({
-        from: TWILIO_CONFIG.phoneNumber,
+      // Создаём запись в БД
+      await this.createCallRecord(callId, client);
+
+      // 🔧 ИСПРАВЛЕНИЕ: Используем правильные настройки
+      const baseUrl =
+        TWILIO_CONFIG.serverUrl ||
+        CONFIG.SERVER_URL ||
+        `http://localhost:${CONFIG.PORT || 3000}`;
+
+      const callParams = {
         to: client.phone,
-        url: twimlUrl,
-        statusCallback: `${process.env.SERVER_URL}/api/webhooks/status/${callId}`,
+        from: TWILIO_CONFIG.phoneNumber, // 🔧 ИСПРАВЛЕНО: используем TWILIO_CONFIG
+        url: `${baseUrl}/api/webhooks/twiml`,
+        statusCallback: `${baseUrl}/api/webhooks/status/${callId}`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        statusCallbackMethod: 'POST',
-        timeout: TWILIO_CONFIG.timeout,
-        record: TWILIO_CONFIG.recordCalls,
+        method: 'POST',
+        record: false,
+        timeout: TWILIO_CONFIG.timeout || 30,
+      };
+
+      logger.info('🔍 Call parameters before Twilio API call:', {
+        to: callParams.to,
+        from: callParams.from,
+        fromType: typeof callParams.from,
+        fromLength: callParams.from ? callParams.from.length : 0,
+        url: callParams.url,
+        statusCallback: callParams.statusCallback,
       });
 
-      // Update call data with Twilio SID
-      this.activeCalls.get(callId).twilioCallSid = call.sid;
+      // Инициируем звонок через Twilio
+      const call = await this.twilioClient.calls.create(callParams);
 
-      // Update database with Twilio SID
-      await Call.findOneAndUpdate(
-        { call_id: callId },
-        { twilio_call_sid: call.sid }
-      );
+      callData.twilioSid = call.sid;
+      callData.twilioCallSid = call.sid; // 🔧 ДОБАВЛЯЕМ: Для совместимости
 
       logger.info(`✅ Call initiated: ${callId} -> Twilio SID: ${call.sid}`);
-      logger.info(`📞 TwiML URL will be handled by Console settings`);
+      logger.info('📞 TwiML URL will be handled by Console settings');
 
       return {
+        success: true,
         callId,
-        twilioCallSid: call.sid,
+        twilioSid: call.sid,
+        twilioCallSid: call.sid, // 🔧 ДОБАВЛЯЕМ: Для совместимости
         clientName: client.name,
         phone: client.phone,
         status: 'initiated',
       };
     } catch (error) {
-      logger.error(`❌ Failed to initiate call for client ${clientId}:`, error);
+      logger.error('❌ Call initiation failed:', error);
+      logger.error('❌ Error details:', {
+        message: error.message,
+        code: error.code,
+        status: error.status,
+      });
       throw error;
     }
   }
 
+  // 🔧 ДОБАВЛЯЕМ: Методы для совместимости с routes/webhooks.js
+
   /**
-   * Handle TTS completion and store audio data
+   * Get active call data (совместимость с первым файлом)
+   */
+  getActiveCall(callId) {
+    return this.activeCalls.get(callId);
+  }
+
+  /**
+   * Generate TwiML response for Twilio webhook (совместимость с первым файлом)
+   */
+  async generateTwiMLResponse(callId, context = 'initial') {
+    return this.generateTwiML(callId, context);
+  }
+
+  /**
+   * Generate error TwiML (совместимость с первым файлом)
+   */
+  generateErrorTwiML() {
+    logger.warn(`⚠️ Generating error TwiML`);
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Tatyana" language="ru-RU">Извините, произошла техническая ошибка. До свидания.</Say>
+    <Hangup/>
+</Response>`;
+  }
+
+  /**
+   * Get all active calls summary (совместимость с первым файлом)
+   */
+  getAllActiveCalls() {
+    return Array.from(this.activeCalls.entries()).map(([callId, data]) => ({
+      callId,
+      clientId: data.clientId,
+      phone: data.phone,
+      status: data.status,
+      currentStage: data.currentStage,
+      startTime: new Date(data.startTime),
+      duration: Date.now() - data.startTime,
+      hasAudio: this.pendingAudio.has(callId),
+      twilioCallSid: data.twilioCallSid || data.twilioSid,
+    }));
+  }
+
+  /**
+   * Get call metrics and statistics (совместимость с первым файлом)
+   */
+  getCallMetrics() {
+    const activeCalls = this.getAllActiveCalls();
+    const byStatus = activeCalls.reduce((acc, call) => {
+      acc[call.status] = (acc[call.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    return {
+      total: activeCalls.length,
+      byStatus,
+      pendingAudio: this.pendingAudio.size,
+      longestCall:
+        activeCalls.length > 0
+          ? Math.max(...activeCalls.map((call) => call.duration))
+          : 0,
+    };
+  }
+
+  /**
+   * Handle TTS completion and store audio data (совместимость с первым файлом)
    */
   handleTTSCompleted(callId, audioData) {
     logger.info(`🎯 TTS COMPLETED for call ${callId}:`, {
       source: audioData.source,
-      hasAudioUrl: !audioData.audioUrl,
+      hasAudioUrl: !!audioData.audioUrl,
       hasAudioBuffer: !!audioData.audioBuffer,
       twilioTTS: audioData.twilioTTS,
       type: audioData.type,
@@ -190,7 +258,7 @@ export class OutboundCallManager {
   }
 
   /**
-   * Check if TTS is still in progress for a call
+   * Check if TTS is still in progress for a call (совместимость с первым файлом)
    */
   checkTTSInProgress(callId) {
     const callData = this.activeCalls.get(callId);
@@ -200,60 +268,559 @@ export class OutboundCallManager {
     return callData.greetingJobId && !this.pendingAudio.has(callId);
   }
 
+  // === ВСЕ ОСТАЛЬНЫЕ МЕТОДЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ ===
+
   /**
-   * Find callId by Twilio CallSid (for requests without callId)
+   * Предгенерация приветствия
    */
-  findCallIdByTwilioSid(twilioCallSid) {
-    for (const [callId, callData] of this.activeCalls.entries()) {
-      if (callData.twilioCallSid === twilioCallSid) {
-        return callId;
-      }
+  async preGenerateGreeting(callId) {
+    try {
+      const callData = this.activeCalls.get(callId);
+      if (!callData) return;
+
+      const greetingScript = DebtCollectionScripts.getScript(
+        'start',
+        'positive',
+        callData.session.clientData
+      );
+
+      logger.info(`Greeting pre-generated for call: ${callId}`);
+
+      // Генерируем TTS для приветствия
+      await this.generateResponseTTS(
+        callId,
+        greetingScript.text,
+        'urgent',
+        'greeting'
+      );
+
+      logger.info(`🎉 Greeting ready for call ${callId} - audio prepared!`);
+    } catch (error) {
+      logger.error(`Error pre-generating greeting for ${callId}:`, error);
     }
-    return null;
   }
 
   /**
-   * Generate TwiML response for Twilio webhook
+   * Создание записи звонка в БД
    */
-  async generateTwiMLResponse(callId, context = 'initial') {
-    const callData = this.activeCalls.get(callId);
+  async createCallRecord(callId, client) {
+    try {
+      const callRecord = new Call({
+        call_id: callId,
+        client_id: client._id,
+        client_name: client.name,
+        client_phone: client.phone,
+        debt_amount: client.debt_amount,
+        status: 'initiated',
+        start_time: new Date(),
+        conversation: [],
+        current_stage: 'start',
+      });
 
-    // Handle unknown calls
+      await callRecord.save();
+      logger.info(
+        `✅ Call record created in DB: ${callId} for client: ${client._id}`
+      );
+    } catch (error) {
+      logger.error(`❌ Failed to create call record for ${callId}:`, error);
+    }
+  }
+
+  /**
+   * Генерация TTS для ответа
+   */
+  async generateResponseTTS(
+    callId,
+    text,
+    priority = 'normal',
+    type = 'response'
+  ) {
+    try {
+      logger.info(
+        `Generating ${type} TTS for call ${callId}: ${text.substring(0, 50)}...`
+      );
+
+      const result = await ttsManager.synthesizeSpeech(text, {
+        priority,
+        voiceId: CONFIG.ELEVENLABS_VOICE_ID,
+        useCache: type === 'greeting' || priority === 'urgent',
+      });
+
+      if (result.audioBuffer || result.audioUrl) {
+        let audioUrl = result.audioUrl;
+
+        // Если есть buffer, сохраняем как файл
+        if (result.audioBuffer && !audioUrl) {
+          const audioFile = await audioManager.saveAudioFile(
+            callId,
+            result.audioBuffer,
+            type
+          );
+          audioUrl = audioFile.publicUrl;
+        }
+
+        // Сохраняем готовое аудио
+        this.pendingAudio.set(callId, {
+          audioUrl,
+          audioBuffer: result.audioBuffer,
+          source: result.source,
+          type,
+          timestamp: Date.now(),
+          consumed: false,
+        });
+
+        logger.info(`Audio saved for call ${callId} (${type}): ${audioUrl}`);
+        return { success: true, audioUrl, source: result.source };
+      }
+
+      throw new Error('No audio generated');
+    } catch (error) {
+      logger.error(`❌ TTS generation failed for call ${callId}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Обработка записи разговора
+   */
+  async processRecording(callId, recordingUrl, recordingDuration) {
+    const callData = this.activeCalls.get(callId);
     if (!callData) {
-      logger.warn(`TwiML requested for unknown call: ${callId}`);
-      return this.generateErrorTwiML();
+      logger.error(
+        `Cannot process recording: call data not found for ${callId}`
+      );
+      return null;
+    }
+
+    // Проверяем, не обрабатывается ли уже запись
+    if (this.recordingProcessing.has(callId)) {
+      logger.warn(`Recording already being processed for call: ${callId}`);
+      return null;
+    }
+
+    this.recordingProcessing.set(callId, true);
+    logger.info(`🎤 Marked recording as processing for call: ${callId}`);
+
+    try {
+      logger.info(
+        `🧠 Starting AI processing for call: ${callId} (attempt 1/3)`
+      );
+      logger.info(
+        `🎤 Processing recording for call ${callId}: ${recordingUrl}`
+      );
+
+      // Скачиваем аудио
+      const audioBuffer = await this.downloadRecording(recordingUrl);
+      if (!audioBuffer || audioBuffer.length === 0) {
+        throw new Error('Failed to download or empty audio buffer');
+      }
+
+      const audioPath = await audioManager.saveRecordingForDebug(
+        callId,
+        audioBuffer,
+        recordingDuration
+      );
+
+      // Транскрибируем аудио
+      const transcriptionStart = Date.now();
+      const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
+      const transcriptionTime = Date.now() - transcriptionStart;
+
+      const transcription = transcriptionResult.text?.trim() || '';
+
+      logger.info(`🎯 TRANSCRIPTION RESULT for call ${callId}:`, {
+        text: transcription,
+        audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
+        duration: `${recordingDuration}s`,
+        transcriptionTime: `${transcriptionTime}ms`,
+        charCount: transcription.length,
+        wordCount: transcription.split(' ').filter((w) => w.length > 0).length,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Проверяем качество транскрипции
+      if (!transcription || transcription.length < 3) {
+        logger.warn(`⚠️ Empty or too short transcription for call ${callId}`);
+        return this.handleEmptyTranscription(callId);
+      }
+
+      // Классифицируем ответ
+      logger.info(
+        `🔍 Classifying response for call ${callId}: "${transcription.substring(0, 50)}..."`
+      );
+
+      const classificationResult = await AIServices.classifyResponse(
+        transcription,
+        callData.currentStage,
+        callData.conversation.map((c) => c.content)
+      );
+
+      const classification = classificationResult?.classification || 'neutral';
+
+      logger.info(`📊 Classification result for call ${callId}:`, {
+        text: transcription,
+        classification,
+        confidence: classificationResult?.confidence || 'unknown',
+      });
+
+      // Обновляем трекер повторений
+      const repeatCount = this.updateClassificationTracker(
+        callId,
+        classification
+      );
+
+      // Подготавливаем контекст для генерации ответа
+      const responseContext = {
+        callId,
+        clientMessage: transcription,
+        classification,
+        conversationHistory: callData.conversation.map((c) => c.content),
+        clientData: callData.session.clientData,
+        currentStage: callData.currentStage,
+        repeatCount,
+      };
+
+      // Генерируем ответ через новую систему
+      logger.info(
+        `🎯 Generating response for call ${callId} using advanced logic:`,
+        {
+          classification,
+          repeatCount,
+          currentStage: callData.currentStage,
+        }
+      );
+
+      const responseResult =
+        await this.generateAdvancedResponse(responseContext);
+
+      logger.info(`🤖 AI ответил: "${responseResult.text}"`);
+
+      logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
+        userInput: transcription,
+        classification,
+        aiResponse: responseResult.text,
+        nextStage: responseResult.nextStage,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Обновляем разговор
+      callData.conversation.push({
+        role: 'user',
+        content: transcription,
+        timestamp: new Date(),
+        duration: recordingDuration,
+        classification,
+        audioInfo: {
+          size: audioBuffer.length,
+          path: audioPath,
+          transcriptionTime,
+        },
+      });
+
+      callData.conversation.push({
+        role: 'assistant',
+        content: responseResult.text,
+        timestamp: new Date(),
+        classification,
+        nextStage: responseResult.nextStage,
+        generationMethod: responseResult.method,
+      });
+
+      // Обновляем этап разговора
+      callData.currentStage = responseResult.nextStage;
+
+      // Генерируем TTS для ответа (если разговор не завершён)
+      if (responseResult.text && responseResult.nextStage !== 'completed') {
+        logger.info(
+          `🎤 Generating TTS for AI response: "${responseResult.text.substring(0, 30)}..."`
+        );
+        await this.generateResponseTTS(callId, responseResult.text, 'normal');
+      }
+
+      // Обновляем базу данных
+      await Call.findOneAndUpdate(
+        { call_id: callId },
+        {
+          $push: {
+            conversation: {
+              user_message: transcription,
+              ai_response: responseResult.text,
+              classification,
+              generation_method: responseResult.method,
+              repeat_count: repeatCount,
+              timestamp: new Date(),
+              metadata: {
+                audio_size: audioBuffer.length,
+                audio_duration: recordingDuration,
+                transcription_time: transcriptionTime,
+                audio_path: audioPath,
+              },
+            },
+          },
+          current_stage: responseResult.nextStage,
+          last_transcription: transcription,
+          last_classification: classification,
+          response_generation_metrics: responseResult.metrics,
+        }
+      );
+
+      logger.info(`✅ Removed processing marker for call: ${callId}`);
+      logger.info(
+        `✅ Recording processed for call: ${callId} - ${classification}`
+      );
+      logger.info(`🔄 Continuing conversation for call: ${callId}`);
+
+      return {
+        transcription,
+        classification,
+        response: responseResult.text,
+        nextStage: responseResult.nextStage,
+        method: responseResult.method,
+        repeatCount,
+      };
+    } catch (error) {
+      logger.error(`❌ Audio processing failed for call ${callId}:`, {
+        error: error.message,
+        stack: error.stack,
+        audioSize: audioBuffer?.length || 'unknown',
+        duration: recordingDuration,
+      });
+      return this.handleRecordingError(callId, error);
+    } finally {
+      this.recordingProcessing.delete(callId);
+    }
+  }
+
+  /**
+   * Генерация ответа через новую систему
+   */
+  async generateAdvancedResponse(responseContext) {
+    const { callId } = responseContext;
+
+    try {
+      // Проверяем количество неудач GPT для этого звонка
+      const gptFailures = this.gptFailureCounter.get(callId) || 0;
+
+      if (gptFailures >= CONFIG.MAX_GPT_FAILURES_BEFORE_FALLBACK) {
+        logger.warn(
+          `⚠️ Too many GPT failures for call ${callId}, forcing script mode`
+        );
+        return this.generateScriptResponse(responseContext);
+      }
+
+      // Пытаемся использовать responseGenerator
+      const response =
+        await responseGenerator.generateResponse(responseContext);
+
+      // Сбрасываем счётчик при успехе
+      this.gptFailureCounter.set(callId, 0);
+
+      return response;
+    } catch (error) {
+      logger.error(
+        `❌ Advanced response generation failed for call ${callId}:`,
+        error
+      );
+
+      // Увеличиваем счётчик неудач
+      const currentFailures = this.gptFailureCounter.get(callId) || 0;
+      this.gptFailureCounter.set(callId, currentFailures + 1);
+
+      // Фолбэк на простые скрипты
+      return this.generateScriptResponse(responseContext);
+    }
+  }
+
+  /**
+   * Фолбэк генерация через скрипты
+   */
+  generateScriptResponse(responseContext) {
+    const { classification, currentStage, clientData, repeatCount } =
+      responseContext;
+
+    logger.info(
+      `📜 Using script fallback for classification: ${classification}`
+    );
+
+    // Получаем варианты ответов
+    const responseVariants = DebtCollectionScripts.getResponseVariants(
+      currentStage,
+      classification,
+      clientData
+    );
+
+    // Выбираем вариант на основе повторений
+    const variantIndex = Math.min(repeatCount, responseVariants.length - 1);
+    const selectedResponse =
+      responseVariants[variantIndex] || responseVariants[0];
+
+    return {
+      text: selectedResponse.text,
+      nextStage: selectedResponse.nextStage,
+      method: 'script',
+      isValid: true,
+    };
+  }
+
+  /**
+   * Трекинг повторений классификаций
+   */
+  updateClassificationTracker(callId, classification) {
+    if (!this.classificationTracker.has(callId)) {
+      this.classificationTracker.set(callId, {});
+    }
+
+    const callTracker = this.classificationTracker.get(callId);
+    const currentCount = callTracker[classification] || 0;
+    const newCount = currentCount + 1;
+
+    callTracker[classification] = newCount;
+
+    logger.info(`📊 Classification tracking for call ${callId}:`, {
+      classification,
+      count: newCount,
+      allClassifications: callTracker,
+    });
+
+    return newCount - 1; // Возвращаем количество предыдущих повторений
+  }
+
+  /**
+   * Скачивание записи
+   */
+  async downloadRecording(recordingUrl) {
+    try {
+      const maxRetries = 3;
+      let lastError;
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          if (attempt > 1) {
+            logger.warn(
+              `⏰ Recording not ready yet, waiting 3 more seconds...`
+            );
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+          }
+
+          const response = await axios.get(recordingUrl, {
+            responseType: 'arraybuffer',
+            headers: {
+              'User-Agent': 'DebtCollection-AI/1.0',
+            },
+            timeout: 30000,
+            auth: {
+              username: CONFIG.TWILIO_ACCOUNT_SID,
+              password: CONFIG.TWILIO_AUTH_TOKEN,
+            },
+          });
+
+          if (response.data && response.data.byteLength > 1000) {
+            const message =
+              attempt > 1
+                ? `✅ Recording downloaded on retry: ${response.data.byteLength} bytes`
+                : `✅ Recording downloaded: ${response.data.byteLength} bytes`;
+            logger.info(message);
+
+            return Buffer.from(response.data);
+          }
+
+          throw new Error(
+            `Recording too small: ${response.data?.byteLength || 0} bytes`
+          );
+        } catch (error) {
+          lastError = error;
+          if (attempt === maxRetries) {
+            throw error;
+          }
+          logger.warn(
+            `⚠️ Download attempt ${attempt} failed: ${error.message}`
+          );
+        }
+      }
+
+      throw lastError;
+    } catch (error) {
+      logger.error('❌ Failed to download recording:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Обработка пустой транскрипции
+   */
+  handleEmptyTranscription(callId) {
+    logger.warn(
+      `⚠️ Empty transcription for call ${callId}, prompting for repeat`
+    );
+
+    const promptResponse = 'Я вас не слышу. Говорите пожалуйста громче.';
+
+    // Генерируем TTS для промпта
+    this.generateResponseTTS(callId, promptResponse, 'urgent');
+
+    return {
+      transcription: '[EMPTY TRANSCRIPTION]',
+      classification: 'unclear',
+      response: promptResponse,
+      nextStage: 'listening',
+      method: 'fallback',
+    };
+  }
+
+  /**
+   * Обработка ошибок записи
+   */
+  handleRecordingError(callId, error) {
+    logger.warn(
+      `⚠️ Using enhanced fallback for call ${callId} due to error:`,
+      error.message
+    );
+
+    const fallbackResponse =
+      'Извините, я не расслышал. Не могли бы вы повторить?';
+
+    // Генерируем TTS для фолбэка
+    this.generateResponseTTS(callId, fallbackResponse, 'urgent');
+
+    return {
+      transcription: '[ERROR: Could not process audio]',
+      classification: 'unclear',
+      response: fallbackResponse,
+      nextStage: 'listening',
+      method: 'fallback',
+      error: true,
+    };
+  }
+
+  /**
+   * Генерация TwiML ответа
+   */
+  generateTwiML(callId, context = 'initial') {
+    const callData = this.activeCalls.get(callId);
+    if (!callData) {
+      logger.error(`Call data not found for TwiML generation: ${callId}`);
+      return this.generateSayTwiML(callId, 'Произошла системная ошибка');
     }
 
     logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
 
-    // Check for ready audio first
+    // Проверяем готовое аудио
     const audioData = this.pendingAudio.get(callId);
     if (audioData && !audioData.consumed) {
       logger.info(`🎵 Using ready audio for call: ${callId}`);
 
-      // Mark as consumed
+      // Помечаем как использованное
       audioData.consumed = true;
       this.pendingAudio.set(callId, audioData);
 
-      // Generate appropriate TwiML based on audio type
       if (audioData.audioUrl) {
         logger.info(`🎵 Sending ElevenLabs PLAY TwiML for call: ${callId}`);
         logger.info(`🎵 Audio URL: ${audioData.audioUrl}`);
         return this.generatePlayTwiML(callId, audioData.audioUrl);
-      } else if (audioData.audioBuffer) {
-        // Should not happen as audioManager creates URLs
-        logger.warn(`⚠️ Audio buffer without URL for call: ${callId}`);
-        return this.generateSayTwiML(callId, 'Произошла ошибка со звуком');
       }
     }
 
-    // Check if TTS is still processing
-    if (this.checkTTSInProgress(callId)) {
-      logger.info(`⏳ TTS still in progress for call: ${callId}, redirecting`);
-      return this.generateRedirectTwiML(callId);
-    }
-
-    // Generate fallback TwiML
+    // Фолбэк на простое TTS
     const script = DebtCollectionScripts.getScript(
       callData.currentStage || 'start',
       'positive',
@@ -265,116 +832,60 @@ export class OutboundCallManager {
   }
 
   /**
-   * Generate TwiML with Play tag (for ElevenLabs/cached audio)
+   * Генерация Play TwiML для ElevenLabs
    */
   generatePlayTwiML(callId, audioUrl) {
     logger.info(`🎵 Generating Play TwiML for ElevenLabs audio: ${audioUrl}`);
+    logger.info(`🎵 Sending PLAY TwiML (ElevenLabs) for call: ${callId}`);
+    logger.info(`🎵 Audio URL: ${audioUrl}`);
 
-    return `<?xml version="1.0" encoding="UTF-8"?>
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Play>${audioUrl}</Play>
 <Record 
-    action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+    action="${CONFIG.SERVER_URL}/api/webhooks/recording/${callId}"
     method="POST"
     maxLength="60"       
     playBeep="false"
     timeout="3"          
     finishOnKey="#"
     trim="trim-silence"  
-    recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
+    recordingStatusCallback="${CONFIG.SERVER_URL}/api/webhooks/recording-status/${callId}"
 />
 </Response>`;
+
+    logger.info(`📋 Full TwiML response for call ${callId}:`);
+    logger.info(twiml);
+
+    return twiml;
   }
 
   /**
-   * Generate TwiML with Say tag (for Twilio TTS fallback)
+   * Генерация Say TwiML для фолбэка
    */
   generateSayTwiML(callId, text, voice = 'Polly.Tatyana') {
     logger.warn(`🔊 Generating Say TwiML fallback with voice: ${voice}`);
 
-    return `<?xml version="1.0" encoding="UTF-8"?>
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say voice="${voice}" language="ru-RU">${text}</Say>
     <Record 
-        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+        action="${CONFIG.SERVER_URL}/api/webhooks/recording/${callId}"
         method="POST"
         maxLength="60"
         playBeep="false"
         timeout="3"
         trim="trim-silence"  
         finishOnKey="#"
-        recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
+        recordingStatusCallback="${CONFIG.SERVER_URL}/api/webhooks/recording-status/${callId}"
     />
 </Response>`;
+
+    return twiml;
   }
 
   /**
-   * Generate redirect TwiML (for waiting on TTS)
-   */
-  generateRedirectTwiML(callId) {
-    logger.info(`🔄 Generating redirect TwiML for call: ${callId}`);
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Pause length="2"/>
-    <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
-</Response>`;
-  }
-
-  /**
-   * Generate error TwiML
-   */
-  generateErrorTwiML() {
-    logger.warn(`⚠️ Generating error TwiML`);
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Tatyana" language="ru-RU">Извините, произошла техническая ошибка. До свидания.</Say>
-    <Hangup/>
-</Response>`;
-  }
-
-  /**
-   * Generate response TTS for conversation continuation
-   */
-  async generateResponseTTS(callId, responseText, priority = 'normal') {
-    const callData = this.activeCalls.get(callId);
-    if (!callData) {
-      logger.warn(
-        `⚠️ callData не найден для ${callId}, но продолжаем — возможно call уже завершён, генерируем финальный ответ`
-      );
-      // Альтернатива: можеш зберігати відповідь у базу або чергу
-      return;
-    }
-
-    logger.info(
-      `Generating response TTS for call ${callId}: ${responseText.substring(0, 50)}...`
-    );
-
-    // Determine if this is a final response (higher priority)
-    const isFinal =
-      responseText.toLowerCase().includes('свидания') ||
-      responseText.toLowerCase().includes('спасибо') ||
-      priority === 'urgent';
-
-    const ttsJob = await ttsQueue.add(
-      'synthesize',
-      {
-        text: responseText,
-        callId: callId,
-        priority: isFinal ? 'urgent' : 'normal',
-        type: 'response',
-        useCache: isFinal, // Cache farewells
-      },
-      {
-        priority: isFinal ? 1 : 5,
-        attempts: 2,
-      }
-    );
-
-    return { ttsJobId: ttsJob.id, responseText };
-  }
-
-  /**
-   * Handle call answered event
+   * Обработка ответа на звонок
    */
   async handleCallAnswered(callId) {
     const callData = this.activeCalls.get(callId);
@@ -383,10 +894,8 @@ export class OutboundCallManager {
       return { ready: false };
     }
 
-    // Update status
     callData.status = 'answered';
 
-    // Update database
     await Call.findOneAndUpdate(
       { call_id: callId },
       {
@@ -397,7 +906,6 @@ export class OutboundCallManager {
 
     logger.info(`📞 Call answered: ${callId}`);
 
-    // Check if greeting is ready
     const audioData = this.pendingAudio.get(callId);
     if (audioData) {
       logger.info(
@@ -406,7 +914,6 @@ export class OutboundCallManager {
       return { ready: true, audioType: audioData.source };
     }
 
-    // Return fallback script if audio not ready
     const script = DebtCollectionScripts.getScript(
       'start',
       'positive',
@@ -420,489 +927,288 @@ export class OutboundCallManager {
   }
 
   /**
-   * Process recording and generate AI response
+   * Обновление статуса звонка
    */
-  async processRecording(callId, recordingUrl, recordingDuration) {
+  async updateCallStatus(callId, status, data = {}) {
     const callData = this.activeCalls.get(callId);
-    if (!callData) {
-      logger.error(
-        `Cannot process recording: call data not found for ${callId}`
-      );
-      throw new Error(`Call data not found: ${callId}`);
+    if (callData) {
+      callData.status = status;
+      callData.lastActivity = Date.now();
     }
-
-    logger.info(`🎤 Processing recording for call ${callId}: ${recordingUrl}`);
 
     try {
-      // Wait a bit for Twilio to fully process the recording
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const updateData = { status, [`${status}_time`]: new Date(), ...data };
+      await Call.findOneAndUpdate({ call_id: callId }, updateData);
 
-      // Download and process audio with proper Twilio auth
-      const twilioAuth = Buffer.from(
-        `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
-      ).toString('base64');
-
-      const response = await fetch(recordingUrl, {
-        method: 'GET',
-        headers: {
-          Authorization: `Basic ${twilioAuth}`,
-          'User-Agent': 'AI-Call-Backend/1.0',
-          Accept: 'audio/wav,audio/mpeg,audio/*',
-        },
-      });
-
-      if (!response.ok) {
-        // If still 404, try to wait a bit more and retry once
-        if (response.status === 404) {
-          logger.warn(`⏰ Recording not ready yet, waiting 3 more seconds...`);
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-
-          const retryResponse = await fetch(recordingUrl, {
-            method: 'GET',
-            headers: {
-              Authorization: `Basic ${twilioAuth}`,
-              'User-Agent': 'AI-Call-Backend/1.0',
-              Accept: 'audio/wav,audio/mpeg,audio/*',
-            },
-          });
-
-          if (!retryResponse.ok) {
-            throw new Error(
-              `Failed to fetch recording after retry: ${retryResponse.status} ${retryResponse.statusText}`
-            );
-          }
-
-          const audioBuffer = Buffer.from(await retryResponse.arrayBuffer());
-          logger.info(
-            `✅ Recording downloaded on retry: ${audioBuffer.length} bytes`
-          );
-          return await this.processAudioBuffer(
-            callId,
-            audioBuffer,
-            recordingDuration
-          );
-        }
-
-        throw new Error(
-          `Failed to fetch recording: ${response.status} ${response.statusText}`
-        );
-      }
-
-      const audioBuffer = Buffer.from(await response.arrayBuffer());
-      logger.info(`✅ Recording downloaded: ${audioBuffer.length} bytes`);
-
-      return await this.processAudioBuffer(
-        callId,
-        audioBuffer,
-        recordingDuration
-      );
+      logger.info(`📞 Call ${status}: ${callId}`);
     } catch (error) {
-      logger.error(`❌ Recording processing failed for call ${callId}:`, error);
-
-      // Fallback: try to continue conversation without transcription
-      return this.handleRecordingError(callId, error);
+      logger.error(`❌ Failed to update call status for ${callId}:`, error);
     }
   }
 
   /**
-   * Process audio buffer and generate AI response (с улучшенным логированием)
+   * Завершение звонка
    */
-  async processAudioBuffer(callId, audioBuffer, recordingDuration) {
-    const callData = this.activeCalls.get(callId);
-
-    try {
-      // Ensure recordings directory exists
-      const recordingsDir = './public/audio/recordings';
-      await fs.mkdir(recordingsDir, { recursive: true });
-
-      // Save audio for debugging with more info
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const audioPath = `${recordingsDir}/${callId}_${timestamp}.wav`;
-      await fs.writeFile(audioPath, audioBuffer);
-
-      logger.info(`🎵 Audio saved for debugging: ${audioPath}`, {
-        callId,
-        audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
-        duration: `${recordingDuration}s`,
-        timestamp,
-      });
-
-      // Transcribe with AIServices (исправлено!)
-      logger.info(`🎧 Starting transcription for call ${callId}...`);
-      const transcriptionStart = Date.now();
-
-      // Используем AIServices вместо openaiManager
-      const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
-      const transcription = transcriptionResult.text; // Извлекаем текст из результата
-
-      logger.info(`🗣️ Клиент сказал (транскрипция): "${transcription}"`);
-
-      const transcriptionTime = Date.now() - transcriptionStart;
-
-      // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ТРАНСКРИПЦИИ
-      logger.info(`🎯 TRANSCRIPTION RESULT for call ${callId}:`, {
-        text: transcription,
-        audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
-        duration: `${recordingDuration}s`,
-        transcriptionTime: `${transcriptionTime}ms`,
-        charCount: transcription?.length || 0,
-        wordCount: transcription?.split(' ').length || 0,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Дополнительный лог для консоли (хорошо видно)
-      console.log('='.repeat(60));
-      console.log(`🗣️  СОБЕСЕДНИК СКАЗАЛ (${callId}):`);
-      console.log(`📝  "${transcription}"`);
-      console.log(
-        `⏱️  Длительность: ${recordingDuration}s | Размер: ${(audioBuffer.length / 1024).toFixed(1)} KB`
-      );
-      console.log(`🕐  ${new Date().toLocaleString('ru-RU')}`);
-      console.log('='.repeat(60));
-
-      if (!transcription || transcription.trim().length === 0) {
-        logger.warn(`⚠️ Empty transcription for call ${callId}`, {
-          audioSize: audioBuffer.length,
-          duration: recordingDuration,
-          audioPath,
-        });
-        return this.handleEmptyTranscription(callId);
-      }
-
-      // Проверка на подозрительную транскрипцию
-      if (transcription.length < 3) {
-        logger.warn(
-          `⚠️ Very short transcription for call ${callId}: "${transcription}"`,
-          {
-            charCount: transcription.length,
-            possibleIssue: 'Low audio quality or silence',
-          }
-        );
-      }
-
-      // Update call data with transcription
-      callData.conversation.push({
-        role: 'user',
-        content: transcription,
-        timestamp: new Date(),
-        duration: recordingDuration,
-        audioInfo: {
-          size: audioBuffer.length,
-          path: audioPath,
-          transcriptionTime,
-        },
-      });
-
-      // Classify user response and generate AI reply
-      logger.info(
-        `🔍 Classifying response for call ${callId}: "${transcription.substring(0, 50)}..."`
-      );
-
-      const classification =
-        (
-          await AIServices.classifyResponse(
-            transcription,
-            callData.currentStage,
-            callData.conversation.map((c) => c.content)
-          )
-        )?.classification || 'neutral';
-
-      logger.info(`📊 Classification result for call ${callId}:`, {
-        text: transcription,
-        classification,
-        confidence: 'high', // можно добавить confidence из classifier
-      });
-
-      // Generate simple AI response (вместо openaiManager)
-      const aiResponse = {
-        text: this.generateSimpleResponse(classification, transcription),
-        nextStage: this.determineNextStage(classification),
-      };
-
-      logger.info(`🤖 AI ответил: "${aiResponse.text}"`);
-
-      // 🔥 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ AI ОТВЕТА
-      logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
-        userInput: transcription,
-        classification,
-        aiResponse: aiResponse.text,
-        nextStage: aiResponse.nextStage,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Дополнительный лог для консоли AI ответа
-      console.log('🤖 AI ОТВЕЧАЕТ:');
-      console.log(`💬 "${aiResponse.text}"`);
-      console.log(
-        `🏷️  Классификация: ${classification} | Следующий этап: ${aiResponse.nextStage}`
-      );
-      console.log('-'.repeat(60));
-
-      // Add AI response to conversation
-      callData.conversation.push({
-        role: 'assistant',
-        content: aiResponse.text,
-        timestamp: new Date(),
-        classification: classification,
-        nextStage: aiResponse.nextStage,
-      });
-
-      // Generate TTS for response
-      if (aiResponse.text && aiResponse.nextStage !== 'completed') {
-        logger.info(
-          `🎤 Generating TTS for AI response: "${aiResponse.text.substring(0, 30)}..."`
-        );
-        await this.generateResponseTTS(callId, aiResponse.text, 'normal');
-      }
-
-      // Update database with detailed conversation log
-      await Call.findOneAndUpdate(
-        { call_id: callId },
-        {
-          $push: {
-            conversation: {
-              user_message: transcription,
-              ai_response: aiResponse.text,
-              classification: classification,
-              timestamp: new Date(),
-              metadata: {
-                audio_size: audioBuffer.length,
-                audio_duration: recordingDuration,
-                transcription_time: transcriptionTime,
-                audio_path: audioPath,
-              },
-            },
-          },
-          current_stage: aiResponse.nextStage || callData.session.currentStage,
-          last_transcription: transcription,
-          last_classification: classification,
-        }
-      );
-
-      return {
-        transcription,
-        classification,
-        response: aiResponse.text,
-        nextStage: aiResponse.nextStage,
-      };
-    } catch (error) {
-      logger.error(`❌ Audio processing failed for call ${callId}:`, {
-        error: error.message,
-        stack: error.stack,
-        audioSize: audioBuffer?.length || 'unknown',
-        duration: recordingDuration,
-      });
-      return this.handleRecordingError(callId, error);
-    }
-  }
-
-  /**
-   * Генерирует простой ответ на основе классификации
-   */
-  generateSimpleResponse(classification, userInput) {
-    const responses = {
-      positive: 'Отлично! Давайте обсудим детали погашения долга.',
-      negative: 'Понимаю ваше положение. Давайте найдем компромиссное решение.',
-      neutral:
-        'Не могли бы вы уточнить свою позицию по погашению задолженности?',
-      aggressive:
-        'Прошу вас сохранять спокойствие. Мы можем решить этот вопрос мирно.',
-      hang_up: 'Спасибо за разговор. До свидания.',
-    };
-
-    return (
-      responses[classification] ||
-      'Не могли бы вы повторить? Я не совсем понял.'
-    );
-  }
-
-  /**
-   * Определяет следующий этап разговора
-   */
-  determineNextStage(classification) {
-    switch (classification) {
-      case 'positive':
-        return 'agreement';
-      case 'hang_up':
-        return 'completed';
-      case 'aggressive':
-        return 'de-escalation';
-      default:
-        return 'listening';
-    }
-  }
-
-  /**
-   * Handle recording processing errors gracefully
-   */
-  handleRecordingError(callId, error) {
-    logger.warn(
-      `⚠️ Using fallback response for call ${callId} due to error:`,
-      error.message
-    );
-
-    // Return a generic continuation response
-    const fallbackResponse =
-      'Извините, я не расслышал. Не могли бы вы повторить?';
-
-    // Generate TTS for fallback
-    this.generateResponseTTS(callId, fallbackResponse, 'urgent');
-
-    return {
-      transcription: '[ERROR: Could not process audio]',
-      classification: 'unclear',
-      response: fallbackResponse,
-      nextStage: 'listening',
-      error: true,
-    };
-  }
-
-  /**
-   * Handle empty transcriptions
-   */
-  handleEmptyTranscription(callId) {
-    logger.warn(
-      `⚠️ Empty transcription for call ${callId}, prompting for repeat`
-    );
-
-    const promptResponse = 'Я вас не слышу. Говорите пожалуйста громче.';
-
-    // Generate TTS for prompt
-    this.generateResponseTTS(callId, promptResponse, 'urgent');
-
-    return {
-      transcription: '[EMPTY]',
-      classification: 'silence',
-      response: promptResponse,
-      nextStage: 'listening',
-    };
-  }
-
-  /**
-   * End call and cleanup
-   */
-  async endCall(callId, result = 'completed') {
+  async endCall(callId, result = 'completed', error = null) {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
-      logger.warn(`Attempt to end unknown call: ${callId}`);
+      logger.warn(`Call data not found for ending call: ${callId}`);
       return;
     }
 
-    const endTime = new Date();
-    const duration = endTime.getTime() - callData.startTime.getTime();
+    const duration = Date.now() - callData.startTime;
 
     logger.info(
       `📞 Ending call: ${callId}, result: ${result}, duration: ${duration}ms`
     );
 
-    try {
-      // Save result to database
-      await Promise.all([
-        Client.findByIdAndUpdate(callData.clientId, {
-          $push: {
-            call_history: {
-              date: endTime,
-              result: result,
-              duration: duration,
-              notes: `Call ended: ${result}`,
-            },
-          },
-          $inc: { call_attempts: 1 },
-          last_call_date: endTime,
-        }),
-        Call.findOneAndUpdate(
-          { call_id: callId },
-          {
-            status: 'completed',
-            end_time: endTime,
-            duration: duration,
-            result: result,
-          }
-        ),
-      ]);
+    // Очищаем трекеры
+    this.cleanupCallTrackers(callId);
 
-      logger.info(`✅ Call data saved to database for ${callId}`);
-    } catch (error) {
-      logger.error(`❌ Error saving call end data for ${callId}:`, error);
-    }
-
-    // Cleanup memory
+    // Очищаем ресурсы
     this.activeCalls.delete(callId);
     this.pendingAudio.delete(callId);
+    this.recordingProcessing.delete(callId);
+
+    // Сохраняем финальные данные
+    try {
+      await Call.findOneAndUpdate(
+        { call_id: callId },
+        {
+          status: result,
+          end_time: new Date(),
+          duration_ms: duration,
+          final_stage: callData.currentStage,
+          error_message: error?.message || null,
+        }
+      );
+
+      logger.info(`✅ Call data saved to database for ${callId}`);
+    } catch (dbError) {
+      logger.error(`❌ Failed to save call data for ${callId}:`, dbError);
+    }
 
     logger.info(`✅ Call cleanup completed: ${callId}`);
   }
 
   /**
-   * Get active call data
+   * Очистка трекеров звонка
    */
-  getActiveCall(callId) {
+  cleanupCallTrackers(callId) {
+    if (this.classificationTracker.has(callId)) {
+      const finalStats = this.classificationTracker.get(callId);
+      logger.info(
+        `📊 Final classification stats for call ${callId}:`,
+        finalStats
+      );
+      this.classificationTracker.delete(callId);
+    }
+
+    this.gptFailureCounter.delete(callId);
+  }
+
+  /**
+   * Очистка просроченных звонков
+   */
+  async cleanupStaleCalls() {
+    const now = Date.now();
+    const maxCallDuration = 10 * 60 * 1000; // 10 минут
+    let cleanedCount = 0;
+
+    for (const [callId, callData] of this.activeCalls.entries()) {
+      if (now - callData.startTime > maxCallDuration) {
+        logger.warn(`🧹 Cleaning up stale call: ${callId}`);
+        await this.endCall(callId, 'timeout');
+        cleanedCount++;
+      }
+    }
+
+    return cleanedCount;
+  }
+
+  /**
+   * Найти callId по Twilio SID
+   */
+  findCallIdByTwilioSid(twilioSid) {
+    for (const [callId, callData] of this.activeCalls.entries()) {
+      if (
+        callData.twilioSid === twilioSid ||
+        callData.twilioCallSid === twilioSid
+      ) {
+        logger.info(`✅ Found callId from CallSid: ${callId} -> ${twilioSid}`);
+        return callId;
+      }
+    }
+
+    logger.warn(`⚠️ CallId not found for Twilio SID: ${twilioSid}`);
+    return null;
+  }
+
+  /**
+   * Получить данные звонка по callId
+   */
+  getCallData(callId) {
     return this.activeCalls.get(callId);
   }
 
   /**
-   * Get all active calls summary
+   * Получить данные звонка по Twilio SID
    */
-  getAllActiveCalls() {
-    return Array.from(this.activeCalls.entries()).map(([callId, data]) => ({
-      callId,
-      clientId: data.clientId,
-      phone: data.phone,
-      status: data.status,
-      currentStage: data.currentStage,
-      startTime: data.startTime,
-      duration: Date.now() - data.startTime.getTime(),
-      hasAudio: this.pendingAudio.has(callId),
-      twilioCallSid: data.twilioCallSid,
-    }));
+  getCallDataByTwilioSid(twilioSid) {
+    const callId = this.findCallIdByTwilioSid(twilioSid);
+    return callId ? this.activeCalls.get(callId) : null;
   }
 
   /**
-   * Get call metrics and statistics
+   * Генерация Redirect TwiML (для ожидания TTS)
    */
-  getCallMetrics() {
-    const activeCalls = this.getAllActiveCalls();
-    const byStatus = activeCalls.reduce((acc, call) => {
-      acc[call.status] = (acc[call.status] || 0) + 1;
-      return acc;
-    }, {});
+  generateRedirectTwiML(callId) {
+    const baseUrl =
+      TWILIO_CONFIG.serverUrl ||
+      CONFIG.SERVER_URL ||
+      `http://localhost:${CONFIG.PORT || 3000}`;
 
-    return {
-      total: activeCalls.length,
-      byStatus,
-      pendingAudio: this.pendingAudio.size,
-      longestCall:
-        activeCalls.length > 0
-          ? Math.max(...activeCalls.map((call) => call.duration))
-          : 0,
-    };
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Pause length="2"/>
+    <Redirect method="POST">${baseUrl}/api/webhooks/twiml</Redirect>
+</Response>`;
+
+    logger.info(`🔄 Generating Redirect TwiML for call: ${callId}`);
+    return twiml;
   }
 
   /**
-   * Force cleanup of stale calls (older than maxAgeMs)
+   * Обработка статуса звонка (для webhooks)
    */
-  async cleanupStaleCalls(maxAgeMs = 30 * 60 * 1000) {
-    // 30 minutes default
-    const now = Date.now();
-    const staleCalls = [];
+  async handleCallStatus(callId, status, data = {}) {
+    const callData = this.activeCalls.get(callId);
 
+    if (!callData) {
+      logger.warn(`Call data not found for status update: ${callId}`);
+      return;
+    }
+
+    switch (status) {
+      case 'initiated':
+        await this.updateCallStatus(callId, 'initiated');
+        logger.info(`📞 Call initiated: ${callId}`);
+        break;
+
+      case 'ringing':
+        await this.updateCallStatus(callId, 'ringing');
+        logger.info(`📞 Call ringing: ${callId}`);
+        break;
+
+      case 'in-progress':
+      case 'answered':
+        await this.updateCallStatus(callId, 'answered');
+        logger.info(`📞 Call in progress: ${callId}`);
+        break;
+
+      case 'completed':
+        const duration = data.duration || 0;
+        const sipCode = data.sipCode || '200';
+
+        logger.info(`📞 Call status update: ${callId} - ${status}`, {
+          callSid: data.callSid,
+          duration,
+          sipCode,
+        });
+
+        await this.endCall(callId, 'completed');
+        logger.info(`📞 Call ended: ${callId} with status: ${status}`);
+        break;
+
+      default:
+        logger.info(`📞 Call status update: ${callId} - ${status}`);
+        await this.updateCallStatus(callId, status, data);
+    }
+  }
+
+  /**
+   * Обработка записи из webhook
+   */
+  async handleRecordingReceived(
+    callId,
+    recordingUrl,
+    recordingDuration,
+    digits = null
+  ) {
+    logger.info(`🎤 Recording received for call: ${callId}`, {
+      url: recordingUrl,
+      duration: recordingDuration,
+    });
+
+    // Проверяем на hang up
+    if (digits === 'hangup') {
+      logger.info(`📞 Call hung up during recording: ${callId}`);
+      await this.endCall(callId, 'completed');
+      return;
+    }
+
+    // Обрабатываем запись
+    return await this.processRecording(callId, recordingUrl, recordingDuration);
+  }
+
+  /**
+   * Обработка статуса записи
+   */
+  async handleRecordingStatus(callId, status, data = {}) {
+    logger.info(`🎤 Recording status update: ${callId} - ${status}`, {
+      recordingSid: data.recordingSid,
+      url: data.url,
+    });
+
+    // Здесь можно добавить дополнительную логику обработки статусов записи
+    // Например, очистка временных файлов при завершении записи
+  }
+
+  /**
+   * Получить активные звонки
+   */
+  getActiveCalls() {
+    const calls = [];
     for (const [callId, callData] of this.activeCalls.entries()) {
-      const age = now - callData.startTime.getTime();
-      if (age > maxAgeMs) {
-        staleCalls.push(callId);
+      calls.push({
+        callId,
+        twilioSid: callData.twilioSid || callData.twilioCallSid,
+        status: callData.status,
+        clientId: callData.clientId,
+        currentStage: callData.currentStage,
+        startTime: callData.startTime,
+        duration: Date.now() - callData.startTime,
+      });
+    }
+    return calls;
+  }
+
+  /**
+   * Получить статистику звонков
+   */
+  getCallStatistics() {
+    const stats = {
+      active: this.activeCalls.size,
+      processing: this.recordingProcessing.size,
+      pendingAudio: this.pendingAudio.size,
+      classifications: {},
+      stages: {},
+    };
+
+    // Подсчитываем статистику по этапам и классификациям
+    for (const [callId, callData] of this.activeCalls.entries()) {
+      const stage = callData.currentStage || 'unknown';
+      stats.stages[stage] = (stats.stages[stage] || 0) + 1;
+    }
+
+    for (const [callId, tracker] of this.classificationTracker.entries()) {
+      for (const [classification, count] of Object.entries(tracker)) {
+        stats.classifications[classification] =
+          (stats.classifications[classification] || 0) + count;
       }
     }
 
-    for (const callId of staleCalls) {
-      logger.warn(`🧹 Cleaning up stale call: ${callId}`);
-      await this.endCall(callId, 'timeout');
-    }
-
-    if (staleCalls.length > 0) {
-      logger.info(`🧹 Cleaned up ${staleCalls.length} stale calls`);
-    }
-
-    return staleCalls.length;
+    return stats;
   }
 
   /**
@@ -919,6 +1225,7 @@ export class OutboundCallManager {
   }
 }
 
-// Export singleton instance
-export const outboundManager = new OutboundCallManager();
+// Экспорт singleton instance
+export const outboundManager = new OutboundManager();
+
 logger.info('✅ OutboundManager instance created and exported');

@@ -263,4 +263,271 @@ export class AIServices {
       throw new Error(`Speech synthesis failed: ${error.message}`);
     }
   }
+
+  /**
+   * Генерация ответа через GPT
+   */
+  static async generateResponse(prompt, options = {}) {
+    logger.info('🤖 Начало генерации ответа через GPT', {
+      promptLength: prompt.length,
+      options,
+    });
+
+    if (!CONFIG.OPENAI_API_KEY) {
+      logger.error('❌ OpenAI API ключ не указан для генерации ответов');
+      throw new Error('OpenAI API key not configured');
+    }
+
+    if (!CONFIG.ENABLE_GPT_RESPONSES) {
+      logger.warn('⚠️ GPT генерация ответов отключена в настройках');
+      throw new Error('GPT response generation disabled');
+    }
+
+    try {
+      const {
+        maxTokens = CONFIG.GPT_MAX_RESPONSE_TOKENS || 100,
+        temperature = CONFIG.GPT_TEMPERATURE_RESPONSE || 0.7,
+        model = CONFIG.GPT_MODEL_RESPONSE || 'gpt-3.5-turbo',
+      } = options;
+
+      const startTime = Date.now();
+
+      const response = await openai.chat.completions.create({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: maxTokens,
+        temperature,
+        timeout: CONFIG.GPT_TIMEOUT_RESPONSE || 15000,
+        stop: ['\n\n', 'Клиент:', 'Ростик:'], // Остановочные токены
+      });
+
+      const processingTime = Date.now() - startTime;
+      const generatedText = response.choices[0]?.message?.content?.trim();
+
+      logger.info('✅ GPT ответ сгенерирован', {
+        text: generatedText,
+        length: generatedText?.length || 0,
+        processingTime: `${processingTime}ms`,
+        model,
+        tokensUsed: response.usage?.total_tokens || 0,
+      });
+
+      // Дополнительная валидация
+      const validationResult = this.validateGPTResponse(generatedText);
+
+      if (!validationResult.isValid) {
+        logger.warn('⚠️ GPT ответ не прошёл валидацию', validationResult);
+        throw new Error(
+          `GPT response validation failed: ${validationResult.reason}`
+        );
+      }
+
+      return {
+        text: generatedText,
+        confidence: 0.85,
+        processingTime,
+        tokensUsed: response.usage?.total_tokens || 0,
+        model,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      logger.error('❌ Ошибка генерации GPT ответа', {
+        message: error.message,
+        code: error.code,
+        status: error.status,
+        stack: error.stack?.split('\n')[0],
+      });
+
+      // Ретрай при сетевых ошибках
+      if (
+        this.shouldRetryGPTRequest(error) &&
+        (options.retryCount || 0) < CONFIG.GPT_RETRY_ATTEMPTS
+      ) {
+        logger.info(
+          `🔄 Повторная попытка GPT генерации (${(options.retryCount || 0) + 1}/${CONFIG.GPT_RETRY_ATTEMPTS})`
+        );
+
+        await this.delay(1000 * Math.pow(2, options.retryCount || 0)); // Exponential backoff
+
+        return this.generateResponse(prompt, {
+          ...options,
+          retryCount: (options.retryCount || 0) + 1,
+        });
+      }
+
+      throw new Error(`GPT response generation failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Валидация GPT ответа
+   */
+  static validateGPTResponse(text) {
+    if (!text || typeof text !== 'string') {
+      return {
+        isValid: false,
+        reason: 'Empty or invalid response',
+      };
+    }
+
+    // Проверка длины
+    if (
+      text.length < CONFIG.MIN_RESPONSE_LENGTH ||
+      text.length > CONFIG.MAX_RESPONSE_LENGTH
+    ) {
+      return {
+        isValid: false,
+        reason: `Invalid length: ${text.length} (min: ${CONFIG.MIN_RESPONSE_LENGTH}, max: ${CONFIG.MAX_RESPONSE_LENGTH})`,
+      };
+    }
+
+    // Проверка на системные сообщения
+    if (
+      text.includes('[SYSTEM') ||
+      text.includes('AI:') ||
+      text.includes('GPT:')
+    ) {
+      return {
+        isValid: false,
+        reason: 'Contains system messages',
+      };
+    }
+
+    // Проверка на запрещённые слова
+    const forbiddenWords = [
+      'блять',
+      'сука',
+      'хуй',
+      'пизда',
+      'ебать',
+      'убью',
+      'убить',
+      'найду тебя',
+      'приеду к тебе',
+    ];
+
+    const hasForbiddenWords = forbiddenWords.some((word) =>
+      text.toLowerCase().includes(word)
+    );
+
+    if (hasForbiddenWords) {
+      return {
+        isValid: false,
+        reason: 'Contains forbidden words',
+      };
+    }
+
+    // Проверка на нарушение роли
+    const offTopicKeywords = [
+      'погода',
+      'спорт',
+      'футбол',
+      'политика',
+      'новости',
+      'рецепт',
+      'фильм',
+      'музыка',
+      'игра',
+    ];
+
+    const isOffTopic = offTopicKeywords.some((keyword) =>
+      text.toLowerCase().includes(keyword)
+    );
+
+    if (isOffTopic) {
+      return {
+        isValid: false,
+        reason: 'Off-topic content detected',
+      };
+    }
+
+    // Проверка структуры (не должно быть диалогов)
+    if (/Клиент:|Ростик:|AI:|GPT:/.test(text)) {
+      return {
+        isValid: false,
+        reason: 'Contains dialogue structure',
+      };
+    }
+
+    return {
+      isValid: true,
+      length: text.length,
+    };
+  }
+
+  /**
+   * Определение необходимости ретрая для GPT запроса
+   */
+  static shouldRetryGPTRequest(error) {
+    const retryableErrors = [
+      'timeout',
+      'network',
+      'ECONNRESET',
+      'ENOTFOUND',
+      'rate_limit_exceeded',
+      'server_error',
+    ];
+
+    return retryableErrors.some(
+      (errorType) =>
+        error.message?.toLowerCase().includes(errorType) ||
+        error.code?.toLowerCase().includes(errorType)
+    );
+  }
+
+  /**
+   * Задержка для ретраев
+   */
+  static delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Получение статистики использования GPT
+   */
+  static getGPTUsageStats() {
+    // В продакшене можно подключить к внешней системе мониторинга
+    return {
+      totalRequests: this.gptStats?.totalRequests || 0,
+      successfulRequests: this.gptStats?.successfulRequests || 0,
+      failedRequests: this.gptStats?.failedRequests || 0,
+      averageResponseTime: this.gptStats?.averageResponseTime || 0,
+      totalTokensUsed: this.gptStats?.totalTokensUsed || 0,
+      lastRequestTime: this.gptStats?.lastRequestTime || null,
+    };
+  }
+
+  /**
+   * Инициализация статистики GPT (добавить в конструктор класса если нужно)
+   */
+  static initGPTStats() {
+    this.gptStats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      totalResponseTime: 0,
+      totalTokensUsed: 0,
+      lastRequestTime: null,
+    };
+  }
+
+  /**
+   * Обновление статистики GPT
+   */
+  static updateGPTStats(success, responseTime, tokensUsed) {
+    if (!this.gptStats) this.initGPTStats();
+
+    this.gptStats.totalRequests++;
+    this.gptStats.lastRequestTime = Date.now();
+
+    if (success) {
+      this.gptStats.successfulRequests++;
+      this.gptStats.totalResponseTime += responseTime;
+      this.gptStats.totalTokensUsed += tokensUsed || 0;
+      this.gptStats.averageResponseTime =
+        this.gptStats.totalResponseTime / this.gptStats.successfulRequests;
+    } else {
+      this.gptStats.failedRequests++;
+    }
+  }
 }

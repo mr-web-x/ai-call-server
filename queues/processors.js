@@ -1,12 +1,13 @@
 import { sttQueue, llmQueue, ttsQueue } from './setup.js';
 import { AIServices } from '../services/aiServices.js';
+import { responseGenerator } from '../services/responseGenerator.js';
 import { ttsManager } from '../services/ttsManager.js';
 import { audioManager } from '../services/audioManager.js';
 import { outboundManager } from '../services/outboundManager.js';
 import { logger } from '../utils/logger.js';
 import { cacheManager } from '../services/cacheManager.js';
 
-// STT Queue Processor
+// STT Queue Processor (без изменений)
 sttQueue.process('transcribe', 5, async (job) => {
   const { audioBuffer, callId } = job.data;
 
@@ -24,12 +25,14 @@ sttQueue.process('transcribe', 5, async (job) => {
   }
 });
 
-// LLM Classification Queue Processor
+// LLM Classification Queue Processor - ОБНОВЛЕНО для новой системы
 llmQueue.process('classify', 3, async (job) => {
   const { text, callId, currentStage, conversationHistory } = job.data;
 
   try {
     logger.info(`Processing LLM classification for call: ${callId}`);
+
+    // Используем обновленный метод классификации
     const result = await AIServices.classifyResponse(
       text,
       currentStage,
@@ -47,7 +50,42 @@ llmQueue.process('classify', 3, async (job) => {
   }
 });
 
-// TTS Queue Processor - UPDATED WITH MODERN TTS MANAGER
+// НОВЫЙ: Response Generation Queue Processor
+llmQueue.process('generateResponse', 2, async (job) => {
+  const { responseContext } = job.data;
+  const { callId } = responseContext;
+
+  try {
+    logger.info(`🤖 Processing response generation for call: ${callId}`);
+
+    const result = await responseGenerator.generateResponse(responseContext);
+
+    logger.info(`✅ Response generated for call ${callId}:`, {
+      method: result.method,
+      length: result.text?.length || 0,
+      nextStage: result.nextStage,
+    });
+
+    return {
+      callId,
+      ...result,
+    };
+  } catch (error) {
+    logger.error(`❌ Response generation error for call ${callId}:`, error);
+
+    // Фолбэк на простой ответ
+    const fallbackResponse =
+      responseGenerator.getFallbackResponse(responseContext);
+
+    return {
+      callId,
+      ...fallbackResponse,
+      error: error.message,
+    };
+  }
+});
+
+// TTS Queue Processor - ОБНОВЛЕНО с поддержкой новых типов
 ttsQueue.process('synthesize', 3, async (job) => {
   const { text, callId, priority, type, useCache, voiceId } = job.data;
 
@@ -56,7 +94,7 @@ ttsQueue.process('synthesize', 3, async (job) => {
       `🎤 Processing TTS for call: ${callId}, priority: ${priority}, type: ${type}`
     );
 
-    // Use TTS Manager
+    // Используем TTS Manager
     const result = await ttsManager.synthesizeSpeech(text, {
       voiceId: voiceId,
       priority: priority,
@@ -67,7 +105,7 @@ ttsQueue.process('synthesize', 3, async (job) => {
       `🎯 TTS result for call ${callId}: source=${result.source}, hasAudio=${!!result.audioBuffer}`
     );
 
-    // ВАЖНО: Кэшировать ТОЛЬКО если это новый ElevenLabs результат (не кэш!)
+    // Кэшируем ТОЛЬКО новые ElevenLabs результаты
     if (
       result.source === 'elevenlabs' &&
       result.audioBuffer &&
@@ -80,12 +118,56 @@ ttsQueue.process('synthesize', 3, async (job) => {
       await cacheManager.setCachedAudio(text, result.audioBuffer, voiceId);
     }
 
-    // If we have an audio buffer (ElevenLabs), save it as a file
+    // Если есть audio buffer - сохраняем как файл
     if (result.audioBuffer) {
       const audioFile = await audioManager.saveAudioFile(
         callId,
         result.audioBuffer,
         type || 'response'
+      );
+
+      // Уведомляем OutboundManager о готовности аудио
+      if (outboundManager.onTTSCompleted) {
+        outboundManager.onTTSCompleted(callId, {
+          audioUrl: audioFile.publicUrl,
+          audioBuffer: result.audioBuffer,
+          source: result.source,
+          type: type,
+        });
+      }
+
+      logger.info(`✅ TTS job completed: ${job.id} for call: ${callId}`);
+
+      logger.info(`🎯 TTS Result Details:`, {
+        callId,
+        source: result.source,
+        twilioTTS: false,
+        hasAudioUrl: true,
+        type: type,
+      });
+
+      logger.info(`🎯 TTS COMPLETED for call ${callId}:`, {
+        source: result.source,
+        hasAudioUrl: false,
+        hasAudioBuffer: true,
+        twilioTTS: false,
+        type: type,
+        voiceId: result.voiceId,
+      });
+
+      logger.info(
+        `✅ TTS completed for call ${callId}, audio ready: ${result.source}`
+      );
+
+      // Если это приветствие, особое уведомление
+      if (type === 'greeting') {
+        logger.info(
+          `🎉 Greeting ready for call ${callId} - ${result.source} audio prepared!`
+        );
+      }
+
+      logger.info(
+        `📢 TTS completion notified to OutboundManager for call: ${callId}`
       );
 
       return {
@@ -100,185 +182,118 @@ ttsQueue.process('synthesize', 3, async (job) => {
       };
     }
 
-    // Cache hit - return cached URL (НЕ КЭШИРОВАТЬ ПОВТОРНО!)
-    if (result.source === 'cache' && result.audioUrl) {
+    // Cache hit - возвращаем URL кэша
+    if (result.audioUrl) {
       logger.info(`✅ Using cached ElevenLabs audio: ${result.audioUrl}`);
+
+      if (outboundManager.onTTSCompleted) {
+        outboundManager.onTTSCompleted(callId, {
+          audioUrl: result.audioUrl,
+          source: result.source,
+          type: type,
+        });
+      }
+
       return {
         callId,
         text,
         type,
         audioUrl: result.audioUrl,
-        audioBuffer: null,
         source: result.source,
         voiceId: result.voiceId,
         twilioTTS: false,
+        cached: true,
       };
     }
 
-    // Twilio TTS fallback
+    // Фолбэк на Twilio TTS
+    logger.warn(
+      `⚠️ No audio generated, using Twilio TTS fallback for call: ${callId}`
+    );
+
     return {
       callId,
       text,
       type,
-      audioUrl: null,
-      audioBuffer: null,
-      source: result.source,
-      voiceId: result.voiceId || 'Polly.Tatyana', // Русский голос
+      source: 'twilio',
       twilioTTS: true,
+      fallback: true,
     };
   } catch (error) {
-    logger.error(`❌ TTS Processing Error for call ${callId}:`, error);
+    logger.error(`❌ TTS processing failed for call ${callId}:`, error);
 
-    // Ultimate fallback - return Twilio TTS instruction
+    // Возвращаем fallback
     return {
       callId,
       text,
       type,
-      audioUrl: null,
-      audioBuffer: null,
-      source: 'error_fallback',
-      voiceId: 'Polly.Tatyana', // РУССКИЙ голос для fallback
+      source: 'twilio',
       twilioTTS: true,
       error: error.message,
+      fallback: true,
     };
   }
 });
 
-// =====================================================
-// QUEUE EVENT LISTENERS
-// =====================================================
+// === НАСТРОЙКА ОБРАБОТЧИКОВ ЗАВЕРШЕНИЯ ЗАДАЧ ===
 
-// STT Events
-sttQueue.on('completed', (job, result) => {
-  logger.info(`✅ STT job completed: ${job.id} for call: ${result.callId}`);
-});
-
-sttQueue.on('failed', (job, err) => {
-  logger.error(`❌ STT job failed: ${job.id}`, err);
-});
-
-// LLM Events
-llmQueue.on('completed', (job, result) => {
-  logger.info(`✅ LLM job completed: ${job.id} for call: ${result.callId}`);
-});
-
-llmQueue.on('failed', (job, err) => {
-  logger.error(`❌ LLM job failed: ${job.id}`, err);
-});
-
-// TTS Events - CRITICAL TTS COMPLETION HANDLER
+// TTS completion handler - уведомляет OutboundManager
 ttsQueue.on('completed', (job, result) => {
-  logger.info(`✅ TTS job completed: ${job.id} for call: ${result.callId}`);
+  const { callId, type } = result;
 
-  // ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ РЕЗУЛЬТАТА
-  logger.info(`🎯 TTS Result Details:`, {
-    callId: result.callId,
-    source: result.source,
-    twilioTTS: result.twilioTTS,
-    hasAudioUrl: !!result.audioUrl,
-    type: result.type,
-  });
-
-  // Notify OutboundManager
-  if (result.callId) {
-    outboundManager.handleTTSCompleted(result.callId, result);
+  if (result.audioUrl || result.audioBuffer) {
     logger.info(
-      `📢 TTS completion notified to OutboundManager for call: ${result.callId}`
+      `🎵 TTS audio ready for call ${callId} (${type}): ${result.source}`
+    );
+
+    // Уведомляем OutboundManager
+    if (outboundManager.pendingAudio) {
+      outboundManager.pendingAudio.set(callId, {
+        audioUrl: result.audioUrl,
+        audioBuffer: result.audioBuffer,
+        source: result.source,
+        type: type,
+        timestamp: Date.now(),
+        consumed: false,
+      });
+    }
+  }
+});
+
+// Response generation completion handler
+llmQueue.on('completed', (job, result) => {
+  if (job.name === 'generateResponse') {
+    const { callId, method } = result;
+    logger.info(
+      `🎯 Response generation completed for call ${callId} using ${method}`
     );
   }
 });
 
-ttsQueue.on('failed', (job, err) => {
-  const { callId } = job.data;
-  logger.error(`❌ TTS job failed: ${job.id} for call: ${callId}`, err);
-
-  // Notify manager about failure - will use Twilio TTS fallback
-  try {
-    outboundManager.handleTTSCompleted(callId, {
-      audioUrl: null,
-      text: job.data.text,
-      type: job.data.type,
-      source: 'tts_failed',
-      twilioTTS: true,
-      voiceId: 'alice',
-      error: err.message,
-    });
-  } catch (error) {
-    logger.error(`Failed to handle TTS failure notification:`, error);
-  }
+// Error handlers
+sttQueue.on('failed', (job, error) => {
+  logger.error(`❌ STT job failed:`, {
+    jobId: job.id,
+    callId: job.data?.callId,
+    error: error.message,
+  });
 });
 
-// =====================================================
-// QUEUE HEALTH MONITORING
-// =====================================================
+llmQueue.on('failed', (job, error) => {
+  logger.error(`❌ LLM job failed:`, {
+    jobId: job.id,
+    jobName: job.name,
+    callId: job.data?.callId || job.data?.responseContext?.callId,
+    error: error.message,
+  });
+});
 
-// Monitor queue health every 30 seconds
-setInterval(async () => {
-  try {
-    const [
-      sttWaiting,
-      sttActive,
-      llmWaiting,
-      llmActive,
-      ttsWaiting,
-      ttsActive,
-    ] = await Promise.all([
-      sttQueue.getWaiting(),
-      sttQueue.getActive(),
-      llmQueue.getWaiting(),
-      llmQueue.getActive(),
-      ttsQueue.getWaiting(),
-      ttsQueue.getActive(),
-    ]);
-
-    const stats = {
-      stt: { waiting: sttWaiting.length, active: sttActive.length },
-      llm: { waiting: llmWaiting.length, active: llmActive.length },
-      tts: { waiting: ttsWaiting.length, active: ttsActive.length },
-    };
-
-    // Log if any queues are backed up
-    const totalWaiting =
-      stats.stt.waiting + stats.llm.waiting + stats.tts.waiting;
-    if (totalWaiting > 10) {
-      logger.warn(`Queue backlog detected:`, stats);
-    }
-
-    // Log TTS metrics periodically
-    if (Math.random() < 0.1) {
-      // 10% chance = ~every 5 minutes
-      const ttsMetrics = ttsManager.getMetrics();
-      logger.info(`TTS Metrics:`, ttsMetrics.performance);
-    }
-  } catch (error) {
-    logger.error('Queue health check failed:', error);
-  }
-}, 30000);
-
-// =====================================================
-// QUEUE CLEANUP
-// =====================================================
-
-// Clean completed jobs every hour
-setInterval(
-  async () => {
-    try {
-      const [sttCleaned, llmCleaned, ttsCleaned] = await Promise.all([
-        sttQueue.clean(24 * 60 * 60 * 1000, 'completed'), // 24 hours
-        llmQueue.clean(24 * 60 * 60 * 1000, 'completed'),
-        ttsQueue.clean(6 * 60 * 60 * 1000, 'completed'), // 6 hours (TTS files get cleaned separately)
-      ]);
-
-      if (sttCleaned + llmCleaned + ttsCleaned > 0) {
-        logger.info(
-          `Queue cleanup: ${sttCleaned.length || sttCleaned} STT, ${llmCleaned.length || llmCleaned} LLM, ${ttsCleaned.length || ttsCleaned} TTS jobs removed`
-        );
-      }
-    } catch (error) {
-      logger.error('Queue cleanup failed:', error);
-    }
-  },
-  60 * 60 * 1000
-);
+ttsQueue.on('failed', (job, error) => {
+  logger.error(`❌ TTS job failed:`, {
+    jobId: job.id,
+    callId: job.data?.callId,
+    error: error.message,
+  });
+});
 
 logger.info('🚀 Queue processors initialized with TTS completion handlers');
