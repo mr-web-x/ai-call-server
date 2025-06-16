@@ -1317,7 +1317,7 @@ export class OutboundManager {
   // Установить маркер обработки записи
   setRecordingProcessing(callId, processing = true) {
     if (processing) {
-      this.recordingProcessing.set(callId, true);
+      this.recordingProcessing.set(callId, Date.now()); // ✅ Сохраняем время начала
       logger.info(`🎤 Marked recording as processing for call: ${callId}`);
     } else {
       this.recordingProcessing.delete(callId);

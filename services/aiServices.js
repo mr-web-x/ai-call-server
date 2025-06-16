@@ -297,7 +297,7 @@ export class AIServices {
         messages: [{ role: 'user', content: prompt }],
         max_tokens: maxTokens,
         temperature,
-        timeout: CONFIG.GPT_TIMEOUT_RESPONSE || 15000,
+        // timeout: CONFIG.GPT_TIMEOUT_RESPONSE || 15000,
         stop: ['\n\n', 'Клиент:', 'Ростик:'], // Остановочные токены
       });
 
