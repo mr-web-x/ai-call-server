@@ -17,6 +17,11 @@ export class AIServices {
       bufferSize: audioBuffer?.length || 0,
     });
 
+    console.log(
+      'OpenAI API Key:',
+      CONFIG.OPENAI_API_KEY?.substring(0, 10) + '...'
+    );
+
     if (!CONFIG.OPENAI_API_KEY) {
       logger.error('❌ OpenAI API ключ не указан');
       return {

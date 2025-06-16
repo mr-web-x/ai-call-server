@@ -61,6 +61,7 @@ export class OutboundCallManager {
         twilioCallSid: null,
         greetingJobId: null,
         conversation: [], // ⬅️ ДОБАВЛЕНО для хранения истории разговора
+        processingRecording: true,
       });
 
       // Generate greeting first
