@@ -21,11 +21,31 @@ export class OutboundManager {
     this.recordingProcessing = new Map(); // callId -> boolean
     this.classificationTracker = new Map(); // callId -> { classification -> count }
     this.gptFailureCounter = new Map(); // callId -> failureCount
+    this.conversationStages = new Map(); // callId -> stage info Отслеживание стадий разговора
 
     // 🔧 ИСПРАВЛЕНИЕ: Используем уже созданный twilioClient
     this.twilioClient = twilioClient;
 
     logger.info('🏗️ OutboundCallManager initialized');
+  }
+
+  /**
+   *  Управление стадиями разговора
+   */
+  setConversationStage(callId, stage, audioInfo = null) {
+    const stageData = {
+      stage: stage,
+      timestamp: Date.now(),
+      audioInfo: audioInfo,
+      lastTwiMLRequest: null,
+    };
+
+    this.conversationStages.set(callId, stageData);
+    logger.info(`🎭 Stage changed for ${callId}: ${stage}`);
+  }
+
+  getConversationStage(callId) {
+    return this.conversationStages.get(callId);
   }
 
   /**
@@ -156,10 +176,8 @@ export class OutboundManager {
     }
   }
 
-  // 🔧 ДОБАВЛЯЕМ: Методы для совместимости с routes/webhooks.js
-
   /**
-   * Get active call data (совместимость с первым файлом)
+   * Get active call data
    */
   getActiveCall(callId) {
     return this.activeCalls.get(callId);
@@ -179,7 +197,7 @@ export class OutboundManager {
     logger.warn(`⚠️ Generating error TwiML`);
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Tatyana" language="ru-RU">Извините, произошла техническая ошибка. До свидания.</Say>
+    <Say voice="Polly.Maxim" language="ru-RU">Извините, произошла техническая ошибка. До свидания.</Say>
     <Hangup/>
 </Response>`;
   }
@@ -267,8 +285,6 @@ export class OutboundManager {
     // Check if greeting job exists but audio is not ready yet
     return callData.greetingJobId && !this.pendingAudio.has(callId);
   }
-
-  // === ВСЕ ОСТАЛЬНЫЕ МЕТОДЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ ===
 
   /**
    * Предгенерация приветствия
@@ -825,9 +841,44 @@ export class OutboundManager {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
       logger.error(`Call data not found for TwiML generation: ${callId}`);
-      return this.generateSayTwiML(callId, 'Произошла системная ошибка');
+      return this.generateErrorTwiML(); // ✅ ЭТО УЖЕ ЕСТЬ!
     }
 
+    // 🎯 ПОЛУЧАЕМ ТЕКУЩУЮ СТАДИЮ
+    const stageData = this.getConversationStage(callId);
+    const currentStage = stageData?.stage || 'start';
+
+    logger.info(`🎭 TwiML for ${callId}, stage: ${currentStage}`);
+
+    // 🎯 ПРОВЕРЯЕМ СТАДИЮ ОЖИДАНИЯ
+    if (currentStage === 'greeting_sent' || currentStage === 'response_sent') {
+      const timeSinceStage = Date.now() - stageData.timestamp;
+
+      // Если недавно отправили - просто ждем
+      if (timeSinceStage < 30000) {
+        // 30 секунд
+        logger.info(
+          `⏳ Still waiting for response on ${callId} (${Math.round(timeSinceStage / 1000)}s)`
+        );
+
+        // Возвращаем простой Record без аудио
+        return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Record 
+        action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
+        method="POST"
+        maxLength="60"
+        playBeep="false"
+        timeout="5"
+        finishOnKey="#"
+        trim="trim-silence"
+        recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
+    />
+</Response>`;
+      }
+    }
+
+    // 🎯 ОБЫЧНАЯ ЛОГИКА (существующая)
     logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
 
     // Проверяем готовое аудио
@@ -839,14 +890,27 @@ export class OutboundManager {
       audioData.consumed = true;
       this.pendingAudio.set(callId, audioData);
 
+      // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ
+      if (currentStage === 'start') {
+        this.setConversationStage(callId, 'greeting_sent', {
+          audioUrl: audioData.audioUrl,
+          source: audioData.source,
+        });
+      } else {
+        this.setConversationStage(callId, 'response_sent', {
+          audioUrl: audioData.audioUrl,
+          source: audioData.source,
+        });
+      }
+
       if (audioData.audioUrl) {
         logger.info(`🎵 Sending ElevenLabs PLAY TwiML for call: ${callId}`);
         logger.info(`🎵 Audio URL: ${audioData.audioUrl}`);
-        return this.generatePlayTwiML(callId, audioData.audioUrl);
+        return this.generatePlayTwiML(callId, audioData.audioUrl); // ✅ ЭТО УЖЕ ЕСТЬ!
       }
     }
 
-    // Фолбэк на простое TTS
+    // 🎯 ОБНОВЛЕННЫЙ FALLBACK (существующая логика)
     const script = DebtCollectionScripts.getScript(
       callData.currentStage || 'start',
       'positive',
@@ -854,7 +918,15 @@ export class OutboundManager {
     );
 
     logger.warn(`⚠️ No audio ready for call: ${callId}, using fallback TTS`);
-    return this.generateSayTwiML(callId, script.text, 'Polly.Tatyana');
+
+    // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ ДЛЯ FALLBACK
+    if (currentStage === 'start') {
+      this.setConversationStage(callId, 'greeting_sent', {
+        source: 'twilio_fallback',
+      });
+    }
+
+    return this.generateSayTwiML(callId, script.text, 'Polly.Maxim'); // ✅ Изменили голос на мужской
   }
 
   /**
@@ -889,7 +961,7 @@ export class OutboundManager {
   /**
    * Генерация Say TwiML для фолбэка
    */
-  generateSayTwiML(callId, text, voice = 'Polly.Tatyana') {
+  generateSayTwiML(callId, text, voice = 'Polly.Maxim') {
     logger.warn(`🔊 Generating Say TwiML fallback with voice: ${voice}`);
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -994,6 +1066,7 @@ export class OutboundManager {
     // Очищаем ресурсы
     this.activeCalls.delete(callId);
     this.pendingAudio.delete(callId);
+    this.conversationStages.delete(callId);
     this.recordingProcessing.delete(callId);
 
     // Сохраняем финальные данные
