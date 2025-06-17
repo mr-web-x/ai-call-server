@@ -163,64 +163,157 @@ router.post('/twiml/:callId', async (req, res) => {
 // CALL STATUS WEBHOOK
 // =====================================================
 
-router.post('/recording/:callId', async (req, res) => {
-  const { callId } = req.params;
-  const { RecordingUrl, RecordingDuration, Digits } = req.body;
+// router.post('/recording/:callId', async (req, res) => {
+//   const { callId } = req.params;
+//   const { RecordingUrl, RecordingDuration, Digits } = req.body;
 
-  logger.info(`🎤 Recording received for call: ${callId}`, {
-    url: RecordingUrl,
-    duration: RecordingDuration,
-    digits: Digits,
-  });
+//   logger.info(`🎤 Recording received for call: ${callId}`, {
+//     url: RecordingUrl,
+//     duration: RecordingDuration,
+//     digits: Digits,
+//   });
 
-  try {
-    // 🔥 КРИТИЧНО: Сразу отвечаем Twilio что webhook получен
-    res.status(200).type('text/xml')
-      .send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Pause length="2"/>
-    <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
-</Response>`);
+//   try {
+//     // 🔥 КРИТИЧНО: Сразу отвечаем Twilio что webhook получен
+//     res.status(200).type('text/xml')
+//       .send(`<?xml version="1.0" encoding="UTF-8"?>
+// <Response>
+//     <Pause length="2"/>
+//     <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
+// </Response>`);
 
-    // 🔥 ИСПРАВЛЕНО: НЕ устанавливаем маркер здесь - пусть processRecording сам управляет
-    const callData = outboundManager.getActiveCall(callId);
-    if (!callData) {
-      logger.warn(`⚠️ No call data found for ${callId}, skipping processing`);
-      return;
-    }
+//     // 🔥 ИСПРАВЛЕНО: НЕ устанавливаем маркер здесь - пусть processRecording сам управляет
+//     const callData = outboundManager.getActiveCall(callId);
+//     if (!callData) {
+//       logger.warn(`⚠️ No call data found for ${callId}, skipping processing`);
+//       return;
+//     }
 
-    // Check if call was hung up
-    if (Digits === 'hangup') {
-      logger.info(`📞 Call hung up during recording: ${callId}`);
-      // НЕ трогаем маркеры - просто выходим
-      return;
-    }
+//     // Check if call was hung up
+//     if (Digits === 'hangup') {
+//       logger.info(`📞 Call hung up during recording: ${callId}`);
+//       // НЕ трогаем маркеры - просто выходим
+//       return;
+//     }
 
-    // Validate recording URL
-    if (!RecordingUrl) {
-      logger.warn(`❌ No recording URL provided for call: ${callId}`);
-      return;
-    }
+//     // Validate recording URL
+//     if (!RecordingUrl) {
+//       logger.warn(`❌ No recording URL provided for call: ${callId}`);
+//       return;
+//     }
 
-    // 🔥 АСИНХРОННАЯ ОБРАБОТКА: Запускаем в фоне без блокировки webhook
-    processRecordingAsync(callId, RecordingUrl, RecordingDuration);
-  } catch (error) {
-    logger.error(`❌ Recording webhook error for call ${callId}:`, error);
+//     // 🔥 АСИНХРОННАЯ ОБРАБОТКА: Запускаем в фоне без блокировки webhook
+//     processRecordingAsync(callId, RecordingUrl, RecordingDuration);
+//   } catch (error) {
+//     logger.error(`❌ Recording webhook error for call ${callId}:`, error);
 
-    // Если еще не отвечали - отвечаем с ошибкой
-    if (!res.headersSent) {
-      res
-        .status(500)
-        .type('text/xml')
-        .send(outboundManager.generateErrorTwiML());
-    }
-  }
-});
+//     // Если еще не отвечали - отвечаем с ошибкой
+//     if (!res.headersSent) {
+//       res
+//         .status(500)
+//         .type('text/xml')
+//         .send(outboundManager.generateErrorTwiML());
+//     }
+//   }
+// });
 
 // =====================================================
 // RECORDING PROCESSING WEBHOOK - УЛУЧШЕННАЯ ВЕРСИЯ
 // =====================================================
 
+// router.post('/recording/:callId', async (req, res) => {
+//   const { callId } = req.params;
+//   const { RecordingUrl, RecordingDuration, Digits } = req.body;
+
+//   logger.info(`🎤 Recording received for call: ${callId}`, {
+//     url: RecordingUrl,
+//     duration: RecordingDuration,
+//     digits: Digits,
+//   });
+
+//   try {
+//     // 🔥 КРИТИЧНО: Сразу отвечаем Twilio что webhook получен
+//     res.status(200).type('text/xml')
+//       .send(`<?xml version="1.0" encoding="UTF-8"?>
+// <Response>
+//     <Pause length="2"/>
+//     <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
+// </Response>`);
+
+//     // ✅ ПРОВЕРКА НА ДВОЙНУЮ ОБРАБОТКУ
+//     if (outboundManager.recordingProcessing.has(callId)) {
+//       logger.warn(
+//         `⚠️ Recording ${callId} already being processed, skipping duplicate webhook`
+//       );
+//       return; // Выходим немедленно, не обрабатываем дубликат
+//     }
+
+//     // ✅ УСТАНАВЛИВАЕМ МАРКЕР НЕМЕДЛЕННО
+//     outboundManager.recordingProcessing.set(callId, true);
+//     logger.info(`🎤 Marked recording as processing for call: ${callId}`);
+
+//     const callData = outboundManager.getActiveCall(callId);
+//     if (!callData) {
+//       logger.warn(
+//         `⚠️ No call data found for ${callId}, but continuing processing`
+//       );
+//       // НЕ возвращаемся, продолжаем обработку
+//     }
+
+//     // // 🔥 ИСПРАВЛЕНО: Используем this.recordingProcessing вместо callData.processingRecording
+//     // const callData = outboundManager.getActiveCall(callId);
+//     // if (callData) {
+//     //   // Проверяем, не обрабатывается ли уже запись
+//     //   if (outboundManager.recordingProcessing.has(callId)) {
+//     //     logger.warn(`⚠️ Recording already being processed for call: ${callId}`);
+//     //     return;
+//     //   }
+
+//     //   // Устанавливаем маркер через outboundManager
+//     //   outboundManager.recordingProcessing.set(callId, true);
+//     //   logger.info(`🎤 Marked recording as processing for call: ${callId}`);
+//     // } else {
+//     //   logger.warn(
+//     //     `⚠️ No call data found for ${callId}, but continuing processing`
+//     //   );
+//     // }
+
+//     // Check if call was hung up
+//     if (Digits === 'hangup') {
+//       logger.info(`📞 Call hung up during recording: ${callId}`);
+
+//       // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager
+//       outboundManager.recordingProcessing.delete(callId);
+//       return;
+//     }
+
+//     // Validate recording URL
+//     if (!RecordingUrl) {
+//       logger.warn(`❌ No recording URL provided for call: ${callId}`);
+
+//       // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager
+//       outboundManager.recordingProcessing.delete(callId);
+//       return;
+//     }
+
+//     // 🔥 АСИНХРОННАЯ ОБРАБОТКА: Запускаем в фоне без блокировки webhook
+//     processRecordingAsync(callId, RecordingUrl, RecordingDuration);
+//   } catch (error) {
+//     logger.error(`❌ Recording webhook error for call ${callId}:`, error);
+
+//     // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager в случае ошибки
+//     outboundManager.recordingProcessing.delete(callId);
+
+//     // Если еще не отвечали - отвечаем с ошибкой
+//     if (!res.headersSent) {
+//       res
+//         .status(500)
+//         .type('text/xml')
+//         .send(outboundManager.generateErrorTwiML());
+//     }
+//   }
+// });
+
 router.post('/recording/:callId', async (req, res) => {
   const { callId } = req.params;
   const { RecordingUrl, RecordingDuration, Digits } = req.body;
@@ -236,73 +329,131 @@ router.post('/recording/:callId', async (req, res) => {
     res.status(200).type('text/xml')
       .send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Pause length="2"/>
+    <Pause length="1"/>
     <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
 </Response>`);
 
-    // ✅ ПРОВЕРКА НА ДВОЙНУЮ ОБРАБОТКУ
+    // ✅ ПРОВЕРКА НА ДВОЙНУЮ ОБРАБОТКУ (ТОЛЬКО ПРОВЕРКА, НЕ УСТАНОВКА)
     if (outboundManager.recordingProcessing.has(callId)) {
+      const existingTimestamp = outboundManager.recordingProcessing.get(callId);
+      const processingTime = Date.now() - (existingTimestamp || Date.now());
+
       logger.warn(
-        `⚠️ Recording ${callId} already being processed, skipping duplicate webhook`
+        `⚠️ Recording ${callId} already being processed (${processingTime}ms), skipping duplicate webhook`
       );
       return; // Выходим немедленно, не обрабатываем дубликат
     }
 
-    // ✅ УСТАНАВЛИВАЕМ МАРКЕР НЕМЕДЛЕННО
-    outboundManager.recordingProcessing.set(callId, true);
-    logger.info(`🎤 Marked recording as processing for call: ${callId}`);
-
+    // ✅ ВАЛИДАЦИЯ ДАННЫХ ЗВОНКА
     const callData = outboundManager.getActiveCall(callId);
     if (!callData) {
       logger.warn(
-        `⚠️ No call data found for ${callId}, but continuing processing`
+        `⚠️ No call data found for ${callId}. Call may have been completed or expired.`
       );
-      // НЕ возвращаемся, продолжаем обработку
+      // Продолжаем обработку - возможно, это поздний webhook
     }
 
-    // // 🔥 ИСПРАВЛЕНО: Используем this.recordingProcessing вместо callData.processingRecording
-    // const callData = outboundManager.getActiveCall(callId);
-    // if (callData) {
-    //   // Проверяем, не обрабатывается ли уже запись
-    //   if (outboundManager.recordingProcessing.has(callId)) {
-    //     logger.warn(`⚠️ Recording already being processed for call: ${callId}`);
-    //     return;
-    //   }
-
-    //   // Устанавливаем маркер через outboundManager
-    //   outboundManager.recordingProcessing.set(callId, true);
-    //   logger.info(`🎤 Marked recording as processing for call: ${callId}`);
-    // } else {
-    //   logger.warn(
-    //     `⚠️ No call data found for ${callId}, but continuing processing`
-    //   );
-    // }
-
-    // Check if call was hung up
+    // ✅ ПРОВЕРКА НА ЗАВЕРШЕНИЕ ЗВОНКА
     if (Digits === 'hangup') {
       logger.info(`📞 Call hung up during recording: ${callId}`);
 
-      // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager
-      outboundManager.recordingProcessing.delete(callId);
+      // Обновляем статус звонка в базе данных
+      try {
+        await Call.findOneAndUpdate(
+          { call_id: callId },
+          {
+            status: 'completed',
+            end_reason: 'client_hangup',
+            updated_at: new Date(),
+          }
+        );
+      } catch (dbError) {
+        logger.warn(
+          `⚠️ Failed to update call status for ${callId}:`,
+          dbError.message
+        );
+      }
+
       return;
     }
 
-    // Validate recording URL
-    if (!RecordingUrl) {
-      logger.warn(`❌ No recording URL provided for call: ${callId}`);
-
-      // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager
-      outboundManager.recordingProcessing.delete(callId);
+    // ✅ ВАЛИДАЦИЯ URL ЗАПИСИ
+    if (!RecordingUrl || typeof RecordingUrl !== 'string') {
+      logger.warn(`❌ Invalid or missing recording URL for call: ${callId}`, {
+        recordingUrl: RecordingUrl,
+        type: typeof RecordingUrl,
+      });
       return;
     }
+
+    // ✅ ВАЛИДАЦИЯ ДЛИТЕЛЬНОСТИ ЗАПИСИ
+    const duration = parseInt(RecordingDuration);
+    if (isNaN(duration) || duration < 1) {
+      logger.warn(`❌ Invalid recording duration for call: ${callId}`, {
+        duration: RecordingDuration,
+        parsed: duration,
+      });
+      return;
+    }
+
+    // ✅ ПРОВЕРКА НА СЛИШКОМ КОРОТКИЕ ЗАПИСИ
+    if (duration < 2) {
+      logger.info(
+        `⚠️ Recording too short for call: ${callId} (${duration}s), likely silence or noise`
+      );
+
+      // Генерируем промпт для повторения
+      try {
+        await outboundManager.generateResponseTTS(
+          callId,
+          'Я вас не слышу. Говорите пожалуйста громче.',
+          'urgent',
+          'prompt'
+        );
+      } catch (ttsError) {
+        logger.warn(
+          `⚠️ Failed to generate repeat prompt for ${callId}:`,
+          ttsError.message
+        );
+      }
+
+      return;
+    }
+
+    logger.info(`✅ Recording validation passed for call: ${callId}`, {
+      duration: `${duration}s`,
+      urlLength: RecordingUrl.length,
+      hasCallData: !!callData,
+    });
 
     // 🔥 АСИНХРОННАЯ ОБРАБОТКА: Запускаем в фоне без блокировки webhook
-    processRecordingAsync(callId, RecordingUrl, RecordingDuration);
-  } catch (error) {
-    logger.error(`❌ Recording webhook error for call ${callId}:`, error);
+    // processRecordingAsync сам установит и удалит маркер
+    setImmediate(() => {
+      processRecordingAsync(callId, RecordingUrl, duration).catch((error) => {
+        logger.error(
+          `❌ Uncaught error in processRecordingAsync for ${callId}:`,
+          {
+            error: error.message,
+            errorType: error.constructor.name,
+            timestamp: new Date().toISOString(),
+          }
+        );
+      });
+    });
 
-    // 🔥 ИСПРАВЛЕНО: Убираем маркер через outboundManager в случае ошибки
-    outboundManager.recordingProcessing.delete(callId);
+    logger.info(`🚀 Recording processing initiated for call: ${callId}`);
+  } catch (error) {
+    logger.error(`❌ Recording webhook error for call ${callId}:`, {
+      error: error.message,
+      errorType: error.constructor.name,
+      stack: error.stack?.split('\n')[0],
+      requestBody: {
+        url: RecordingUrl?.substring(0, 100) + '...',
+        duration: RecordingDuration,
+        digits: Digits,
+      },
+      timestamp: new Date().toISOString(),
+    });
 
     // Если еще не отвечали - отвечаем с ошибкой
     if (!res.headersSent) {
@@ -318,95 +469,233 @@ router.post('/recording/:callId', async (req, res) => {
 // АСИНХРОННАЯ ФУНКЦИЯ ОБРАБОТКИ ЗАПИСИ
 // =====================================================
 
+// async function processRecordingAsync(callId, recordingUrl, recordingDuration) {
+//   // ✅ ДОПОЛНИТЕЛЬНАЯ ЗАЩИТА ОТ ДУБЛИКАТОВ
+//   if (outboundManager.recordingProcessing.has(callId)) {
+//     const processingTime =
+//       Date.now() -
+//       (outboundManager.recordingProcessing.get(callId) || Date.now());
+//     if (processingTime < 30000) {
+//       // Если обработка началась меньше 30 сек назад
+//       logger.warn(
+//         `⚠️ Recording ${callId} still being processed (${processingTime}ms), skipping duplicate`
+//       );
+//       return;
+//     }
+//   }
+
+//   const maxRetries = 3;
+//   let retryCount = 0;
+
+//   while (retryCount < maxRetries) {
+//     try {
+//       logger.info(
+//         `🧠 Starting AI processing for call: ${callId} (attempt ${retryCount + 1}/${maxRetries})`
+//       );
+
+//       // 🔥 ИСПРАВЛЕНО: processRecording сам управляет маркерами
+//       // НЕ устанавливаем и НЕ удаляем маркеры здесь
+//       const processingPromise = outboundManager.processRecording(
+//         callId,
+//         recordingUrl,
+//         recordingDuration
+//       );
+
+//       // Timeout после 2 минут
+//       const timeoutPromise = new Promise((_, reject) => {
+//         setTimeout(() => reject(new Error('Processing timeout')), 120000);
+//       });
+
+//       const result = await Promise.race([processingPromise, timeoutPromise]);
+
+//       if (!result) {
+//         logger.warn(`❌ No processing result for call: ${callId}`);
+//         return;
+//       }
+
+//       logger.info(
+//         `✅ Recording processed for call: ${callId} - ${result.classification}`
+//       );
+
+//       // Continue conversation if needed
+//       if (result.response && result.nextStage !== 'completed') {
+//         logger.info(`🔄 Continuing conversation for call: ${callId}`);
+//       } else {
+//         logger.info(`📞 Conversation completed for call: ${callId}`);
+//       }
+
+//       outboundManager.recordingProcessing.delete(callId);
+//       logger.info(`✅ Removed processing marker for call: ${callId}`);
+
+//       break; // Успешно обработано, выходим из цикла retry
+//     } catch (error) {
+//       retryCount++;
+
+//       logger.error(
+//         `❌ Recording processing error for call ${callId} (attempt ${retryCount}/${maxRetries}):`,
+//         {
+//           error: error.message,
+//           stack: error.stack,
+//           errorType: error.constructor.name,
+//           recordingUrl,
+//           recordingDuration,
+//           callData: outboundManager.getActiveCall(callId)
+//             ? 'exists'
+//             : 'missing',
+//         }
+//       );
+
+//       if (retryCount >= maxRetries) {
+//         logger.error(
+//           `❌ Max retry attempts reached for call ${callId}, giving up`
+//         );
+//         break;
+//       }
+
+//       // Пауза перед повторной попыткой (экспоненциальная задержка)
+//       const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
+//       logger.info(`⏳ Retrying in ${delay}ms...`);
+//       await new Promise((resolve) => setTimeout(resolve, delay));
+//     }
+//   }
+// }
+
 async function processRecordingAsync(callId, recordingUrl, recordingDuration) {
-  // ✅ ДОПОЛНИТЕЛЬНАЯ ЗАЩИТА ОТ ДУБЛИКАТОВ
+  // ✅ УСТАНОВКА МАРКЕРА В САМОМ НАЧАЛЕ
   if (outboundManager.recordingProcessing.has(callId)) {
-    const processingTime =
-      Date.now() -
-      (outboundManager.recordingProcessing.get(callId) || Date.now());
+    const existingTimestamp = outboundManager.recordingProcessing.get(callId);
+    const processingTime = Date.now() - (existingTimestamp || Date.now());
+
     if (processingTime < 30000) {
       // Если обработка началась меньше 30 сек назад
       logger.warn(
         `⚠️ Recording ${callId} still being processed (${processingTime}ms), skipping duplicate`
       );
       return;
+    } else {
+      // Старый маркер, возможно зависший - очищаем и продолжаем
+      logger.warn(
+        `⚠️ Found stale processing marker for ${callId} (${processingTime}ms), clearing and continuing`
+      );
+      outboundManager.recordingProcessing.delete(callId);
     }
   }
+
+  // ✅ УСТАНАВЛИВАЕМ МАРКЕР С ВРЕМЕННОЙ МЕТКОЙ
+  outboundManager.recordingProcessing.set(callId, Date.now());
+  logger.info(`🎤 Marked recording as processing for call: ${callId}`);
 
   const maxRetries = 3;
   let retryCount = 0;
+  let processingResult = null;
 
-  while (retryCount < maxRetries) {
-    try {
-      logger.info(
-        `🧠 Starting AI processing for call: ${callId} (attempt ${retryCount + 1}/${maxRetries})`
-      );
+  try {
+    while (retryCount < maxRetries) {
+      try {
+        logger.info(
+          `🧠 Starting AI processing for call: ${callId} (attempt ${retryCount + 1}/${maxRetries})`
+        );
 
-      // 🔥 ИСПРАВЛЕНО: processRecording сам управляет маркерами
-      // НЕ устанавливаем и НЕ удаляем маркеры здесь
-      const processingPromise = outboundManager.processRecording(
-        callId,
-        recordingUrl,
-        recordingDuration
-      );
+        // 🔥 ВЫЗЫВАЕМ processRecording БЕЗ установки маркеров внутри него
+        const processingPromise = outboundManager.processRecording(
+          callId,
+          recordingUrl,
+          recordingDuration
+        );
 
-      // Timeout после 2 минут
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Processing timeout')), 120000);
-      });
+        // Timeout после 2 минут
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Processing timeout')), 120000);
+        });
 
-      const result = await Promise.race([processingPromise, timeoutPromise]);
+        const result = await Promise.race([processingPromise, timeoutPromise]);
 
-      if (!result) {
-        logger.warn(`❌ No processing result for call: ${callId}`);
-        return;
+        if (!result) {
+          logger.warn(`❌ No processing result for call: ${callId}`);
+          return;
+        }
+
+        processingResult = result;
+
+        logger.info(
+          `✅ Recording processed for call: ${callId} - ${result.classification}`
+        );
+
+        // Continue conversation if needed
+        if (result.response && result.nextStage !== 'completed') {
+          logger.info(`🔄 Continuing conversation for call: ${callId}`);
+        } else {
+          logger.info(`📞 Conversation completed for call: ${callId}`);
+        }
+
+        break; // Успешно обработано, выходим из цикла retry
+      } catch (error) {
+        retryCount++;
+
+        logger.error(
+          `❌ Recording processing error for call ${callId} (attempt ${retryCount}/${maxRetries}):`,
+          {
+            error: error.message,
+            stack: error.stack?.split('\n')[0], // Только первая строка стека
+            errorType: error.constructor.name,
+            recordingUrl: recordingUrl?.substring(0, 100) + '...', // Сокращаем URL
+            recordingDuration,
+            callData: outboundManager.getActiveCall(callId)
+              ? 'exists'
+              : 'missing',
+            timestamp: new Date().toISOString(),
+          }
+        );
+
+        if (retryCount >= maxRetries) {
+          logger.error(
+            `❌ Max retry attempts reached for call ${callId}, giving up`
+          );
+          break;
+        }
+
+        // Пауза перед повторной попыткой (экспоненциальная задержка)
+        const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
+        logger.info(`⏳ Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-
-      logger.info(
-        `✅ Recording processed for call: ${callId} - ${result.classification}`
-      );
-
-      // Continue conversation if needed
-      if (result.response && result.nextStage !== 'completed') {
-        logger.info(`🔄 Continuing conversation for call: ${callId}`);
-      } else {
-        logger.info(`📞 Conversation completed for call: ${callId}`);
+    }
+  } catch (criticalError) {
+    // Критическая ошибка на уровне всей функции
+    logger.error(
+      `❌ Critical error in processRecordingAsync for call ${callId}:`,
+      {
+        error: criticalError.message,
+        errorType: criticalError.constructor.name,
+        timestamp: new Date().toISOString(),
       }
+    );
+  } finally {
+    // ✅ СОХРАНЯЕМ ВРЕМЯ СТАРТА ДО УДАЛЕНИЯ МАРКЕРА
+    const startTime = outboundManager.recordingProcessing.get(callId);
+    const processingEndTime = Date.now();
 
+    // ✅ ВСЕГДА УДАЛЯЕМ МАРКЕР В FINALLY БЛОКЕ
+    if (outboundManager.recordingProcessing.has(callId)) {
       outboundManager.recordingProcessing.delete(callId);
       logger.info(`✅ Removed processing marker for call: ${callId}`);
-
-      break; // Успешно обработано, выходим из цикла retry
-    } catch (error) {
-      retryCount++;
-
-      logger.error(
-        `❌ Recording processing error for call ${callId} (attempt ${retryCount}/${maxRetries}):`,
-        {
-          error: error.message,
-          stack: error.stack,
-          errorType: error.constructor.name,
-          recordingUrl,
-          recordingDuration,
-          callData: outboundManager.getActiveCall(callId)
-            ? 'exists'
-            : 'missing',
-        }
-      );
-
-      if (retryCount >= maxRetries) {
-        logger.error(
-          `❌ Max retry attempts reached for call ${callId}, giving up`
-        );
-        break;
-      }
-
-      // Пауза перед повторной попыткой (экспоненциальная задержка)
-      const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
-      logger.info(`⏳ Retrying in ${delay}ms...`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
     }
+
+    // ✅ ПРАВИЛЬНЫЙ РАСЧЕТ ВРЕМЕНИ ОБРАБОТКИ
+    const totalProcessingTime = startTime ? processingEndTime - startTime : 0; // Если маркера не было, время = 0
+
+    logger.info(`📊 Processing completed for call ${callId}:`, {
+      success: !!processingResult,
+      totalTime: `${totalProcessingTime}ms`,
+      retryAttempts: retryCount,
+      classification: processingResult?.classification || 'failed',
+      nextStage: processingResult?.nextStage || 'error',
+      startTime: startTime ? new Date(startTime).toISOString() : 'unknown',
+      endTime: new Date(processingEndTime).toISOString(),
+    });
   }
+
+  return processingResult;
 }
 
 // =====================================================

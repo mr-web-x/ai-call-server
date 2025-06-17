@@ -212,7 +212,7 @@ export class ResponseGenerator {
     };
 
     // 1. Проверка длины
-    if (text.length > CONFIG.MAX_RESPONSE_LENGTH || 200) {
+    if (text.length > (CONFIG.MAX_RESPONSE_LENGTH || 280)) {
       validationResults.isValid = false;
       validationResults.issues.push('response_too_long');
     }
