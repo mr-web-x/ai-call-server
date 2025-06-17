@@ -15,6 +15,7 @@ router.post('/client/:clientId', validateClientId, async (req, res) => {
 
     // Дополнительная проверка что клиент существует
     const client = await Client.findById(clientId);
+    
     if (!client) {
       return res.status(404).json({
         success: false,

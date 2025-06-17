@@ -1,45 +1,19 @@
-import { v4 as uuidv4 } from "uuid";
-import { VoiceActivityDetector } from "./voiceDetection.js";
-import { DebtCollectionScripts } from "../scripts/debtCollection.js";
-import { sttQueue, llmQueue, ttsQueue } from "../queues/setup.js";
-import { Call } from "../models/Call.js";
-import { logger } from "../utils/logger.js";
+// import { v4 as uuidv4 } from 'uuid';
+import { VoiceActivityDetector } from './voiceDetection.js';
+import { DebtCollectionScripts } from '../scripts/debtCollection.js';
+import { sttQueue, llmQueue, ttsQueue } from '../queues/setup.js';
+import { Call } from '../models/Call.js';
+import { logger } from '../utils/logger.js';
 
 export class CallSession {
   constructor(callId, clientData = {}) {
     this.callId = callId;
     this.clientData = clientData;
-    this.currentStage = "start";
+    this.currentStage = 'start';
     this.conversationHistory = [];
     this.vad = new VoiceActivityDetector();
     this.isProcessing = false;
     this.startTime = new Date();
-
-    // Pre-generate initial greeting
-    this.preGenerateGreeting();
-  }
-
-  async preGenerateGreeting() {
-    try {
-      const script = DebtCollectionScripts.getScript(
-        "start",
-        "positive",
-        this.clientData
-      );
-      await ttsQueue.add(
-        "synthesize",
-        {
-          text: script.text,
-          callId: this.callId,
-          priority: "urgent",
-        },
-        { priority: 1 }
-      );
-
-      logger.info(`Greeting pre-generated for call: ${this.callId}`);
-    } catch (error) {
-      logger.error("Error pre-generating greeting:", error);
-    }
   }
 
   async processAudioChunk(audioBuffer) {
@@ -53,7 +27,7 @@ export class CallSession {
     try {
       // Add STT job
       const sttJob = await sttQueue.add(
-        "transcribe",
+        'transcribe',
         {
           audioBuffer,
           callId: this.callId,
@@ -69,7 +43,7 @@ export class CallSession {
 
         // Add LLM classification job
         const llmJob = await llmQueue.add(
-          "classify",
+          'classify',
           {
             text: sttResult.text,
             callId: this.callId,
@@ -101,13 +75,13 @@ export class CallSession {
 
         // Add TTS job
         const ttsJob = await ttsQueue.add(
-          "synthesize",
+          'synthesize',
           {
             text: script.text,
             callId: this.callId,
             priority: script.priority,
           },
-          { priority: script.priority === "urgent" ? 1 : 3 }
+          { priority: script.priority === 'urgent' ? 1 : 3 }
         );
 
         return {
@@ -119,7 +93,7 @@ export class CallSession {
         };
       }
     } catch (error) {
-      logger.error("Processing error:", error);
+      logger.error('Processing error:', error);
       throw error;
     } finally {
       this.isProcessing = false;
@@ -135,13 +109,13 @@ export class CallSession {
             conversation_history: [
               {
                 timestamp: new Date(),
-                speaker: "client",
+                speaker: 'client',
                 text: clientText,
                 classification: classification,
               },
               {
                 timestamp: new Date(),
-                speaker: "ai",
+                speaker: 'ai',
                 text: aiResponse,
               },
             ],
@@ -150,7 +124,7 @@ export class CallSession {
         { upsert: true }
       );
     } catch (error) {
-      logger.error("Error saving conversation:", error);
+      logger.error('Error saving conversation:', error);
     }
   }
 }

@@ -131,7 +131,7 @@ export class OutboundManager {
 
       const callParams = {
         to: client.phone,
-        from: TWILIO_CONFIG.phoneNumber, // 🔧 ИСПРАВЛЕНО: используем TWILIO_CONFIG
+        from: TWILIO_CONFIG.phoneNumber,
         url: `${baseUrl}/api/webhooks/twiml`,
         statusCallback: `${baseUrl}/api/webhooks/status/${callId}`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
@@ -183,13 +183,6 @@ export class OutboundManager {
    */
   getActiveCall(callId) {
     return this.activeCalls.get(callId);
-  }
-
-  /**
-   * Generate TwiML response for Twilio webhook (совместимость с первым файлом)
-   */
-  async generateTwiMLResponse(callId, context = 'initial') {
-    return this.generateTwiML(callId, context);
   }
 
   /**
@@ -795,80 +788,6 @@ export class OutboundManager {
   }
 
   /**
-   * Обработка пустой транскрипции
-   */
-  // async handleEmptyTranscription(callId, audioSize = 0, duration = 0) {
-  //   logger.warn(
-  //     `⚠️ Empty transcription for call ${callId}, using enhanced detection`
-  //   );
-
-  //   // Анализируем "пустую" транскрипцию как потенциальную тишину
-  //   const whisperAnalysis = whisperDetector.analyzeTranscription(
-  //     '', // пустая строка
-  //     audioSize,
-  //     duration
-  //   );
-
-  //   // Обрабатываем через SilenceHandler
-  //   const silenceResult = await silenceHandler.integrateWithPipeline(
-  //     callId,
-  //     {
-  //       isHallucination: false,
-  //       isSilence: true,
-  //       transcription: '',
-  //     },
-  //     audioSize,
-  //     duration
-  //   );
-
-  //   if (silenceResult && silenceResult.action === 'respond') {
-  //     // Генерируем TTS ответ
-  //     try {
-  //       if (silenceResult.response) {
-  //         await ttsManager.generateTTS(
-  //           callId,
-  //           silenceResult.response,
-  //           'urgent',
-  //           'empty_transcription'
-  //         );
-  //       }
-  //     } catch (ttsError) {
-  //       logger.warn(
-  //         `⚠️ Failed to generate TTS for empty transcription ${callId}:`,
-  //         ttsError.message
-  //       );
-  //     }
-
-  //     return {
-  //       success: true,
-  //       classification: 'empty_transcription',
-  //       response: silenceResult.response,
-  //       nextStage: silenceResult.nextStage,
-  //       shouldContinue: silenceResult.shouldContinue,
-  //       metadata: {
-  //         emptyTranscription: true,
-  //         whisperAnalysis,
-  //         silenceHandling: silenceResult,
-  //       },
-  //     };
-  //   }
-
-  //   // Если не нужно отвечать - просто возвращаем успех
-  //   return {
-  //     success: true,
-  //     classification: 'ignored_empty',
-  //     response: null,
-  //     nextStage: 'listening',
-  //     shouldContinue: true,
-  //     metadata: {
-  //       emptyTranscription: true,
-  //       ignored: true,
-  //       reason: 'Too short or not significant',
-  //     },
-  //   };
-  // }
-
-  /**
    * Обработка ошибок записи
    */
   handleRecordingError(callId, error) {
@@ -909,36 +828,36 @@ export class OutboundManager {
 
     logger.info(`🎭 TwiML for ${callId}, stage: ${currentStage}`);
 
-    // 🎯 ПРОВЕРЯЕМ СТАДИЮ ОЖИДАНИЯ
-    if (currentStage === 'greeting_sent' || currentStage === 'response_sent') {
-      const timeSinceStage = Date.now() - stageData.timestamp;
+    //     // 🎯 ПРОВЕРЯЕМ СТАДИЮ ОЖИДАНИЯ
+    //     if (currentStage === 'greeting_sent' || currentStage === 'response_sent') {
+    //       const timeSinceStage = Date.now() - stageData.timestamp;
 
-      // Если недавно отправили - просто ждем
-      if (timeSinceStage < 30000) {
-        // 30 секунд
-        logger.info(
-          `⏳ Still waiting for response on ${callId} (${Math.round(timeSinceStage / 1000)}s)`
-        );
+    //       // Если недавно отправили - просто ждем
+    //       if (timeSinceStage < 30000) {
+    //         // 30 секунд
+    //         logger.info(
+    //           `⏳ Still waiting for response on ${callId} (${Math.round(timeSinceStage / 1000)}s)`
+    //         );
 
-        // Возвращаем простой Record без аудио
-        return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Record 
-        action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
-        method="POST"
-        maxLength="60"
-        playBeep="false"
-        timeout="5"
-        finishOnKey="#"
-        trim="trim-silence"
-        recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
-    />
-</Response>`;
-      }
-    }
+    //         // Возвращаем простой Record без аудио
+    //         return `<?xml version="1.0" encoding="UTF-8"?>
+    // <Response>
+    //     <Record
+    //         action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
+    //         method="POST"
+    //         maxLength="60"
+    //         playBeep="false"
+    //         timeout="5"
+    //         finishOnKey="#"
+    //         trim="trim-silence"
+    //         recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
+    //     />
+    // </Response>`;
+    //       }
+    //     }
 
     // 🎯 ОБЫЧНАЯ ЛОГИКА (существующая)
-    logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
+    // logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
 
     // Проверяем готовое аудио
     const audioData = this.pendingAudio.get(callId);

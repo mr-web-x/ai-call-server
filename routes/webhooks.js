@@ -53,10 +53,7 @@ router.post('/twiml', async (req, res) => {
 
     // If we found callId, generate proper TwiML
     if (callId) {
-      const twimlResponse = await outboundManager.generateTwiMLResponse(
-        callId,
-        'initial'
-      );
+      const twimlResponse = outboundManager.generateTwiML(callId, 'initial');
 
       if (!twimlResponse) {
         logger.error(`❌ No TwiML generated for call: ${callId}`);
@@ -114,42 +111,6 @@ router.post('/twiml', async (req, res) => {
 </Response>`);
   } catch (error) {
     logger.error(`❌ TwiML generation error:`, error);
-    res.type('text/xml');
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Tatyana" language="ru-RU">Произошла техническая ошибка. До свидания.</Say>
-    <Hangup/>
-</Response>`);
-  }
-});
-
-// =====================================================
-// LEGACY TWIML ENDPOINT (с callId - для обратной совместимости)
-// =====================================================
-
-router.post('/twiml/:callId', async (req, res) => {
-  const { callId } = req.params;
-
-  logger.info(`📞 TwiML requested for specific call: ${callId}`);
-
-  try {
-    const twimlResponse = await outboundManager.generateTwiMLResponse(
-      callId,
-      'initial'
-    );
-
-    if (!twimlResponse) {
-      logger.error(`❌ No TwiML generated for call: ${callId}`);
-      res.type('text/xml');
-      res.send(outboundManager.generateErrorTwiML());
-      return;
-    }
-
-    logger.info(`✅ TwiML generated for call: ${callId}`);
-    res.type('text/xml');
-    res.send(twimlResponse);
-  } catch (error) {
-    logger.error(`❌ TwiML generation error for call ${callId}:`, error);
     res.type('text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -479,10 +440,7 @@ router.post('/continue/:callId', async (req, res) => {
 
   try {
     // Generate TwiML for continuation
-    const twimlResponse = await outboundManager.generateTwiMLResponse(
-      callId,
-      'continue'
-    );
+    const twimlResponse = outboundManager.generateTwiML(callId, 'continue');
 
     res.type('text/xml');
     res.send(twimlResponse);
