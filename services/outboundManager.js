@@ -8,6 +8,8 @@ import { Call } from '../models/Call.js';
 import { Client } from '../models/Client.js';
 import { logger } from '../utils/logger.js';
 import { CONFIG } from '../config/index.js';
+import { whisperDetector } from '../utils/whisperHallucinationDetector.js';
+import { silenceHandler } from './silenceHandler.js';
 
 // 🔧 ИСПРАВЛЕНИЕ: Используем ваш существующий Twilio конфиг
 import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
@@ -399,243 +401,6 @@ export class OutboundManager {
   /**
    * Обработка записи разговора
    */
-  /**
-   * Обработка записи разговора
-   */
-  // async processRecording(callId, recordingUrl, recordingDuration) {
-  //   // const callData = this.activeCalls.get(callId);
-  //   // if (!callData) {
-  //   //   logger.error(
-  //   //     `Cannot process recording: call data not found for ${callId}`
-  //   //   );
-  //   //   return null;
-  //   // }
-
-  //   // // Проверяем, не обрабатывается ли уже запись
-  //   // if (this.recordingProcessing.has(callId)) {
-  //   //   logger.warn(`Recording already being processed for call: ${callId}`);
-  //   //   return null;
-  //   // }
-
-  //   // this.recordingProcessing.set(callId, true);
-  //   // logger.info(`🎤 Marked recording as processing for call: ${callId}`);
-
-  //   try {
-  //     logger.info(
-  //       `🧠 Starting AI processing for call: ${callId} (attempt 1/3)`
-  //     );
-  //     logger.info(
-  //       `🎤 Processing recording for call ${callId}: ${recordingUrl}`
-  //     );
-
-  //     // Скачиваем аудио
-  //     const audioBuffer = await this.downloadRecording(recordingUrl);
-  //     if (!audioBuffer || audioBuffer.length === 0) {
-  //       throw new Error('Failed to download or empty audio buffer');
-  //     }
-
-  //     // 🔥 ИСПРАВЛЕНО: Безопасное сохранение аудио для отладки
-  //     let audioPath = null;
-  //     try {
-  //       // Сохраняем аудио для отладки (опционально)
-  //       if (
-  //         audioManager.saveRecordingForDebug &&
-  //         typeof audioManager.saveRecordingForDebug === 'function'
-  //       ) {
-  //         audioPath = await audioManager.saveRecordingForDebug(
-  //           callId,
-  //           audioBuffer,
-  //           recordingDuration
-  //         );
-  //       } else {
-  //         // Фолбэк - используем обычное сохранение
-  //         const audioFile = await audioManager.saveAudioFile(
-  //           callId,
-  //           audioBuffer,
-  //           'recording'
-  //         );
-  //         audioPath = audioFile.filepath;
-  //       }
-  //       logger.info(`💾 Audio saved for debug: ${audioPath}`);
-  //     } catch (saveError) {
-  //       logger.warn(`⚠️ Failed to save audio for debug: ${saveError.message}`);
-  //       audioPath = null; // Не критично, продолжаем обработку
-  //     }
-
-  //     // Транскрибируем аудио
-  //     const transcriptionStart = Date.now();
-  //     const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
-  //     const transcriptionTime = Date.now() - transcriptionStart;
-
-  //     const transcription = transcriptionResult.text?.trim() || '';
-
-  //     logger.info(`🎯 TRANSCRIPTION RESULT for call ${callId}:`, {
-  //       text: transcription,
-  //       audioSize: `${(audioBuffer.length / 1024).toFixed(1)} KB`,
-  //       duration: `${recordingDuration}s`,
-  //       transcriptionTime: `${transcriptionTime}ms`,
-  //       charCount: transcription.length,
-  //       wordCount: transcription.split(' ').filter((w) => w.length > 0).length,
-  //       timestamp: new Date().toISOString(),
-  //     });
-
-  //     // Проверяем качество транскрипции
-  //     if (!transcription || transcription.length < 3) {
-  //       logger.warn(`⚠️ Empty or too short transcription for call ${callId}`);
-  //       return this.handleEmptyTranscription(callId);
-  //     }
-
-  //     // Классифицируем ответ
-  //     logger.info(
-  //       `🔍 Classifying response for call ${callId}: "${transcription.substring(0, 50)}..."`
-  //     );
-
-  //     const classificationResult = await AIServices.classifyResponse(
-  //       transcription,
-  //       callData.currentStage,
-  //       callData.conversation.map((c) => c.content)
-  //     );
-
-  //     const classification = classificationResult?.classification || 'neutral';
-
-  //     logger.info(`📊 Classification result for call ${callId}:`, {
-  //       text: transcription,
-  //       classification,
-  //       confidence: classificationResult?.confidence || 'unknown',
-  //     });
-
-  //     // Обновляем трекер повторений
-  //     const repeatCount = this.updateClassificationTracker(
-  //       callId,
-  //       classification
-  //     );
-
-  //     // Подготавливаем контекст для генерации ответа
-  //     const responseContext = {
-  //       callId,
-  //       clientMessage: transcription,
-  //       classification,
-  //       conversationHistory: callData.conversation.map((c) => c.content),
-  //       clientData: callData.session.clientData,
-  //       currentStage: callData.currentStage,
-  //       repeatCount,
-  //     };
-
-  //     // Генерируем ответ через новую систему
-  //     logger.info(
-  //       `🎯 Generating response for call ${callId} using advanced logic:`,
-  //       {
-  //         classification,
-  //         repeatCount,
-  //         currentStage: callData.currentStage,
-  //       }
-  //     );
-
-  //     const responseResult =
-  //       await this.generateAdvancedResponse(responseContext);
-
-  //     logger.info(`🤖 AI ответил: "${responseResult.text}"`);
-
-  //     logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
-  //       userInput: transcription,
-  //       classification,
-  //       nextStage: responseResult.nextStage,
-  //       timestamp: new Date().toISOString(),
-  //     });
-
-  //     // Обновляем разговор
-  //     callData.conversation.push({
-  //       role: 'user',
-  //       content: transcription,
-  //       timestamp: new Date(),
-  //       duration: recordingDuration,
-  //       classification,
-  //       audioInfo: {
-  //         size: audioBuffer.length,
-  //         path: audioPath,
-  //         transcriptionTime,
-  //       },
-  //     });
-
-  //     callData.conversation.push({
-  //       role: 'assistant',
-  //       content: responseResult.text,
-  //       timestamp: new Date(),
-  //       classification,
-  //       nextStage: responseResult.nextStage,
-  //       generationMethod: responseResult.method,
-  //     });
-
-  //     // Обновляем этап разговора
-  //     callData.currentStage = responseResult.nextStage;
-
-  //     // Генерируем TTS для ответа (если разговор не завершён)
-  //     if (responseResult.text && responseResult.nextStage !== 'completed') {
-  //       logger.info(
-  //         `🎤 Generating TTS for AI response: "${responseResult.text.substring(0, 30)}..."`
-  //       );
-  //       await this.generateResponseTTS(callId, responseResult.text, 'normal');
-  //     }
-
-  //     // Обновляем базу данных
-  //     await Call.findOneAndUpdate(
-  //       { call_id: callId },
-  //       {
-  //         $push: {
-  //           conversation: {
-  //             user_message: transcription,
-  //             ai_response: responseResult.text,
-  //             classification,
-  //             generation_method: responseResult.method,
-  //             repeat_count: repeatCount,
-  //             timestamp: new Date(),
-  //             metadata: {
-  //               audio_size: audioBuffer.length,
-  //               audio_duration: recordingDuration,
-  //               transcription_time: transcriptionTime,
-  //               audio_path: audioPath, // Может быть null - это нормально
-  //             },
-  //           },
-  //         },
-  //         current_stage: responseResult.nextStage,
-  //         last_transcription: transcription,
-  //         last_classification: classification,
-  //         response_generation_metrics: responseResult.metrics,
-  //       }
-  //     );
-
-  //     logger.info(
-  //       `✅ Recording processed for call: ${callId} - ${classification}`
-  //     );
-  //     logger.info(`🔄 Continuing conversation for call: ${callId}`);
-
-  //     return {
-  //       transcription,
-  //       classification,
-  //       response: responseResult.text,
-  //       nextStage: responseResult.nextStage,
-  //       method: responseResult.method,
-  //       repeatCount,
-  //     };
-  //   } catch (error) {
-  //     logger.error(`❌ Audio processing failed for call ${callId}:`, {
-  //       error: error.message,
-  //       stack: error.stack,
-  //       audioSize: audioBuffer?.length || 'unknown', // 🔥 ИСПРАВЛЕНО: добавлен ?.
-  //       duration: recordingDuration,
-  //       errorType: error.constructor.name,
-  //     });
-  //     return this.handleRecordingError(callId, error);
-  //   } finally {
-  //     // 🔥 ВСЕГДА удаляем маркер в finally блоке
-  //     this.recordingProcessing.delete(callId);
-  //     logger.info(`✅ Removed processing marker for call: ${callId}`);
-  //   }
-  // }
-
-  /**
-   * Обработка записи разговора
-   */
   async processRecording(callId, recordingUrl, recordingDuration) {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
@@ -645,35 +410,28 @@ export class OutboundManager {
       return null;
     }
 
-    try {
-      logger.info(
-        `🧠 Starting AI processing for call: ${callId} (attempt 1/3)`
-      );
-      logger.info(
-        `🎤 Processing recording for call ${callId}: ${recordingUrl}`
-      );
+    let audioBuffer = null;
 
-      // Скачиваем аудио
-      const audioBuffer = await this.downloadRecording(recordingUrl);
+    try {
+      logger.info(`🧠 Starting enhanced AI processing for call: ${callId}`);
+      logger.info(`🎤 Processing recording: ${recordingUrl}`);
+
+      // 📥 СКАЧИВАЕМ АУДИО
+      audioBuffer = await this.downloadRecording(recordingUrl);
       if (!audioBuffer || audioBuffer.length === 0) {
         throw new Error('Failed to download or empty audio buffer');
       }
 
-      // 🔥 ИСПРАВЛЕНО: Безопасное сохранение аудио для отладки
+      // 💾 СОХРАНЯЕМ ДЛЯ ОТЛАДКИ
       let audioPath = null;
       try {
-        // Сохраняем аудио для отладки (опционально)
-        if (
-          audioManager.saveRecordingForDebug &&
-          typeof audioManager.saveRecordingForDebug === 'function'
-        ) {
+        if (audioManager.saveRecordingForDebug) {
           audioPath = await audioManager.saveRecordingForDebug(
             callId,
             audioBuffer,
             recordingDuration
           );
         } else {
-          // Фолбэк - используем обычное сохранение
           const audioFile = await audioManager.saveAudioFile(
             callId,
             audioBuffer,
@@ -684,10 +442,9 @@ export class OutboundManager {
         logger.info(`💾 Audio saved for debug: ${audioPath}`);
       } catch (saveError) {
         logger.warn(`⚠️ Failed to save audio for debug: ${saveError.message}`);
-        audioPath = null; // Не критично, продолжаем обработку
       }
 
-      // Транскрибируем аудио
+      // 🗣️ ТРАНСКРИПЦИЯ ЧЕРЕЗ WHISPER
       const transcriptionStart = Date.now();
       const transcriptionResult = await AIServices.transcribeAudio(audioBuffer);
       const transcriptionTime = Date.now() - transcriptionStart;
@@ -701,175 +458,184 @@ export class OutboundManager {
         transcriptionTime: `${transcriptionTime}ms`,
         charCount: transcription.length,
         wordCount: transcription.split(' ').filter((w) => w.length > 0).length,
-        timestamp: new Date().toISOString(),
       });
 
-      // Проверяем качество транскрипции
-      if (!transcription || transcription.length < 3) {
-        logger.warn(`⚠️ Empty or too short transcription for call ${callId}`);
-        return this.handleEmptyTranscription(callId);
+      // 🎭 АНАЛИЗ ГАЛЛЮЦИНАЦИЙ WHISPER
+      const whisperAnalysis = whisperDetector.analyzeTranscription(
+        transcription,
+        audioBuffer.length,
+        recordingDuration
+      );
+
+      // 🔇 ОБРАБОТКА МОЛЧАНИЯ/ГАЛЛЮЦИНАЦИЙ
+      if (whisperAnalysis.isHallucination || whisperAnalysis.isSilence) {
+        logger.info(`🔇 Detected silence/hallucination for call ${callId}:`, {
+          type: whisperAnalysis.isHallucination ? 'hallucination' : 'silence',
+          confidence: `${Math.round(whisperAnalysis.confidence * 100)}%`,
+          reasons: whisperAnalysis.reasons,
+          recommendation: whisperAnalysis.recommendation,
+        });
+
+        // Обрабатываем через SilenceHandler
+        const silenceResult = await silenceHandler.integrateWithPipeline(
+          callId,
+          {
+            isHallucination: whisperAnalysis.isHallucination,
+            isSilence: whisperAnalysis.isSilence,
+            transcription: transcription,
+          },
+          audioBuffer.length,
+          recordingDuration
+        );
+
+        if (silenceResult && silenceResult.action === 'respond') {
+          // Генерируем TTS ответ на молчание
+          return {
+            success: true,
+            classification: 'silence',
+            response: silenceResult.response,
+            nextStage: silenceResult.nextStage,
+            shouldContinue: silenceResult.shouldContinue,
+            metadata: {
+              silenceType: silenceResult.silenceType,
+              whisperAnalysis,
+              silenceMetadata: silenceResult.metadata,
+            },
+          };
+        } else {
+          // Игнорируем и продолжаем ждать
+          return {
+            success: true,
+            classification: 'ignored_silence',
+            response: null,
+            nextStage: 'listening',
+            shouldContinue: true,
+            metadata: {
+              silenceType: silenceResult?.silenceType || 'unknown',
+              whisperAnalysis,
+              ignored: true,
+              reason: silenceResult?.reason || 'Whisper hallucination',
+            },
+          };
+        }
       }
 
-      // Классифицируем ответ
+      // ✅ РЕАЛЬНАЯ РЕЧЬ - ПРОДОЛЖАЕМ НОРМАЛЬНУЮ ОБРАБОТКУ
+      logger.info(
+        `🗣️ Real speech detected for call ${callId}, proceeding with normal pipeline`
+      );
+
+      // Получаем контекст разговора
+      const conversationHistory = callData.conversationHistory || [];
+      const currentStage = callData.currentStage || 'listening';
+
+      // Классифицируем ответ пользователя
       logger.info(
         `🔍 Classifying response for call ${callId}: "${transcription.substring(0, 50)}..."`
       );
 
       const classificationResult = await AIServices.classifyResponse(
         transcription,
-        callData.currentStage,
-        callData.conversation.map((c) => c.content)
+        currentStage,
+        conversationHistory
       );
 
-      const classification = classificationResult?.classification || 'neutral';
+      const classification = classificationResult.classification || 'neutral';
+      logger.info(`🏷️ Classification result: ${classification}`);
 
-      logger.info(`📊 Classification result for call ${callId}:`, {
-        text: transcription,
-        classification,
-        confidence: classificationResult?.confidence || 'unknown',
-      });
-
-      // Обновляем трекер повторений
+      // Обновляем счетчик повторений классификации
       const repeatCount = this.updateClassificationTracker(
         callId,
         classification
       );
 
-      // Подготавливаем контекст для генерации ответа
-      const responseContext = {
+      // Обновляем историю разговора
+      conversationHistory.push(transcription);
+      callData.conversationHistory = conversationHistory;
+
+      // Генерируем ответ
+      logger.info(`🧠 Generating AI response for ${callId}`);
+      const responseResult = await responseGenerator.generateResponse({
         callId,
+        clientData: callData.clientData,
         clientMessage: transcription,
         classification,
-        conversationHistory: callData.conversation.map((c) => c.content),
-        clientData: callData.session.clientData,
-        currentStage: callData.currentStage,
+        conversationHistory,
+        currentStage,
         repeatCount,
-      };
+      });
 
-      // Генерируем ответ через новую систему
+      if (!responseResult.success) {
+        throw new Error(`Response generation failed: ${responseResult.error}`);
+      }
+
+      // Добавляем ответ AI в историю
+      conversationHistory.push(responseResult.response);
+      callData.conversationHistory = conversationHistory;
+
+      // Обновляем стадию разговора
+      callData.currentStage = responseResult.nextStage;
+
+      // Генерируем TTS
       logger.info(
-        `🎯 Generating response for call ${callId} using advanced logic:`,
+        `🎵 Generating TTS for response: "${responseResult.response}"`
+      );
+
+      const ttsResult = await ttsManager.synthesizeSpeech(
+        responseResult.response,
         {
-          classification,
-          repeatCount,
-          currentStage: callData.currentStage,
+          priority: 'normal',
+          voiceId: process.env.TTS_VOICE_ID,
+          useCache: true,
         }
       );
 
-      const responseResult =
-        await this.generateAdvancedResponse(responseContext);
+      if (ttsResult && (ttsResult.audioUrl || ttsResult.audioBuffer)) {
+        this.pendingAudio.set(callId, {
+          audioUrl: ttsResult.audioUrl,
+          audioBuffer: ttsResult.audioBuffer,
+          source: ttsResult.source,
+          type: 'conversation',
+          timestamp: Date.now(),
+          consumed: false,
+        });
 
-      logger.info(`🤖 AI ответил: "${responseResult.text}"`);
-
-      logger.info(`🤖 AI RESPONSE for call ${callId}:`, {
-        userInput: transcription,
-        classification,
-        nextStage: responseResult.nextStage,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Обновляем разговор
-      callData.conversation.push({
-        role: 'user',
-        content: transcription,
-        timestamp: new Date(),
-        duration: recordingDuration,
-        classification,
-        audioInfo: {
-          size: audioBuffer.length,
-          path: audioPath,
-          transcriptionTime,
-        },
-      });
-
-      callData.conversation.push({
-        role: 'assistant',
-        content: responseResult.text,
-        timestamp: new Date(),
-        method: responseResult.method || 'unknown',
-        nextStage: responseResult.nextStage,
-      });
-
-      // Обновляем стадию звонка
-      if (responseResult.nextStage) {
-        callData.currentStage = responseResult.nextStage;
         logger.info(
-          `🎭 Stage changed for ${callId}: ${responseResult.nextStage}`
+          `🎵 TTS audio ready for call ${callId}: ${ttsResult.source}`
         );
-      }
-
-      // Генерируем TTS для ответа
-      logger.info(
-        `🎤 Generating TTS for AI response: "${responseResult.text.substring(0, 50)}..."`
-      );
-
-      const ttsResult = await this.generateResponseTTS(
-        callId,
-        responseResult.text,
-        'normal',
-        'response'
-      );
-
-      if (!ttsResult.success) {
-        logger.error(
-          `❌ TTS generation failed for call ${callId}:`,
-          ttsResult.error
-        );
-        // Используем fallback
-        await this.generateResponseTTS(
-          callId,
-          'Простите, повторите пожалуйста.',
-          'urgent',
-          'fallback'
-        );
-      }
-
-      // Обновляем статистику звонка
-      callData.statistics = {
-        ...callData.statistics,
-        totalExchanges: callData.conversation.filter((c) => c.role === 'user')
-          .length,
-        lastClassification: classification,
-        averageResponseTime: transcriptionTime,
-        classifications: {
-          ...callData.statistics?.classifications,
-          [classification]:
-            (callData.statistics?.classifications?.[classification] || 0) + 1,
-        },
-      };
-
-      // Проверяем условия завершения звонка
-      if (
-        responseResult.nextStage === 'completed' ||
-        classification === 'hang_up'
-      ) {
-        logger.info(`📞 Call completion conditions met for ${callId}`);
-        await this.endCall(callId, 'completed');
+      } else {
+        logger.warn(`⚠️ TTS generation failed for call ${callId}`);
       }
 
       return {
-        transcription,
+        success: true,
         classification,
-        response: responseResult.text,
+        response: responseResult.response,
         nextStage: responseResult.nextStage,
-        confidence: classificationResult?.confidence || 0.8,
-        processingTime: Date.now() - transcriptionStart,
-        audioInfo: {
-          size: audioBuffer.length,
-          duration: recordingDuration,
-          path: audioPath,
+        shouldContinue: responseResult.nextStage !== 'completed',
+        metadata: {
+          transcription,
+          repeatCount,
+          whisperAnalysis,
+          realSpeech: true,
+          processingTime: {
+            transcription: transcriptionTime,
+            total: Date.now() - transcriptionStart,
+          },
         },
       };
     } catch (error) {
-      logger.error(`❌ Processing error for call ${callId}:`, {
-        error: error.message,
-        errorType: error.constructor.name,
-        stack: error.stack?.split('\n')[0],
-        recordingUrl: recordingUrl?.substring(0, 100) + '...',
-        duration: recordingDuration,
-        timestamp: new Date().toISOString(),
-      });
+      logger.error(
+        `❌ Enhanced recording processing error for call ${callId}:`,
+        {
+          error: error.message,
+          stack: error.stack?.split('\n')[0],
+          audioSize: audioBuffer?.length || 0,
+          duration: recordingDuration,
+        }
+      );
 
+      // Fallback в случае ошибки
       return this.handleRecordingError(callId, error);
     }
   }
@@ -1031,24 +797,76 @@ export class OutboundManager {
   /**
    * Обработка пустой транскрипции
    */
-  handleEmptyTranscription(callId) {
-    logger.warn(
-      `⚠️ Empty transcription for call ${callId}, prompting for repeat`
-    );
+  // async handleEmptyTranscription(callId, audioSize = 0, duration = 0) {
+  //   logger.warn(
+  //     `⚠️ Empty transcription for call ${callId}, using enhanced detection`
+  //   );
 
-    const promptResponse = 'Я вас не слышу. Говорите пожалуйста громче.';
+  //   // Анализируем "пустую" транскрипцию как потенциальную тишину
+  //   const whisperAnalysis = whisperDetector.analyzeTranscription(
+  //     '', // пустая строка
+  //     audioSize,
+  //     duration
+  //   );
 
-    // Генерируем TTS для промпта
-    this.generateResponseTTS(callId, promptResponse, 'urgent');
+  //   // Обрабатываем через SilenceHandler
+  //   const silenceResult = await silenceHandler.integrateWithPipeline(
+  //     callId,
+  //     {
+  //       isHallucination: false,
+  //       isSilence: true,
+  //       transcription: '',
+  //     },
+  //     audioSize,
+  //     duration
+  //   );
 
-    return {
-      transcription: '[EMPTY TRANSCRIPTION]',
-      classification: 'unclear',
-      response: promptResponse,
-      nextStage: 'listening',
-      method: 'fallback',
-    };
-  }
+  //   if (silenceResult && silenceResult.action === 'respond') {
+  //     // Генерируем TTS ответ
+  //     try {
+  //       if (silenceResult.response) {
+  //         await ttsManager.generateTTS(
+  //           callId,
+  //           silenceResult.response,
+  //           'urgent',
+  //           'empty_transcription'
+  //         );
+  //       }
+  //     } catch (ttsError) {
+  //       logger.warn(
+  //         `⚠️ Failed to generate TTS for empty transcription ${callId}:`,
+  //         ttsError.message
+  //       );
+  //     }
+
+  //     return {
+  //       success: true,
+  //       classification: 'empty_transcription',
+  //       response: silenceResult.response,
+  //       nextStage: silenceResult.nextStage,
+  //       shouldContinue: silenceResult.shouldContinue,
+  //       metadata: {
+  //         emptyTranscription: true,
+  //         whisperAnalysis,
+  //         silenceHandling: silenceResult,
+  //       },
+  //     };
+  //   }
+
+  //   // Если не нужно отвечать - просто возвращаем успех
+  //   return {
+  //     success: true,
+  //     classification: 'ignored_empty',
+  //     response: null,
+  //     nextStage: 'listening',
+  //     shouldContinue: true,
+  //     metadata: {
+  //       emptyTranscription: true,
+  //       ignored: true,
+  //       reason: 'Too short or not significant',
+  //     },
+  //   };
+  // }
 
   /**
    * Обработка ошибок записи
@@ -1124,6 +942,13 @@ export class OutboundManager {
 
     // Проверяем готовое аудио
     const audioData = this.pendingAudio.get(callId);
+    logger.info(`🔍 Checking pendingAudio for ${callId}:`, {
+      hasAudioData: !!audioData,
+      audioType: audioData?.type || 'none',
+      consumed: audioData?.consumed || false,
+      audioUrl: audioData?.audioUrl ? 'present' : 'missing',
+    });
+
     if (audioData && !audioData.consumed) {
       logger.info(`🎵 Using ready audio for call: ${callId}`);
 
@@ -1138,6 +963,7 @@ export class OutboundManager {
           source: audioData.source,
         });
       } else {
+        // silence_response, conversation, response - все как обычный ответ
         this.setConversationStage(callId, 'response_sent', {
           audioUrl: audioData.audioUrl,
           source: audioData.source,
@@ -1304,11 +1130,12 @@ export class OutboundManager {
     // Очищаем трекеры
     this.cleanupCallTrackers(callId);
 
+    this.cleanupCallDetectionResources(callId);
+
     // Очищаем ресурсы
     this.activeCalls.delete(callId);
     this.pendingAudio.delete(callId);
     this.conversationStages.delete(callId);
-    this.recordingProcessing.delete(callId);
 
     // Сохраняем финальные данные
     try {
@@ -1329,6 +1156,19 @@ export class OutboundManager {
     }
 
     logger.info(`✅ Call cleanup completed: ${callId}`);
+  }
+
+  cleanupCallDetectionResources(callId) {
+    // Очищаем статистику молчания
+    silenceHandler.cleanupCallStats(callId);
+
+    // Очищаем трекинг классификаций (существующий код)
+    this.classificationTracker.delete(callId);
+
+    // Очищаем маркеры обработки (существующий код)
+    this.recordingProcessing.delete(callId);
+
+    logger.info(`🧹 Cleaned up detection resources for call: ${callId}`);
   }
 
   /**
