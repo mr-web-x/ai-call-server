@@ -2,10 +2,7 @@
 // 🚀 TWILIO MEDIA STREAMS INTEGRATION - ПОЛНАЯ АРХИТЕКТУРА
 // =================================================================
 
-// ✅ 1. НОВЫЙ СЕРВИС: services/mediaStreamManager.js
-// =================================================================
-
-import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 import { logger } from '../utils/logger.js';
 import { EventEmitter } from 'events';
 import { outboundManager } from './outboundManager.js';
@@ -18,7 +15,7 @@ export class MediaStreamManager extends EventEmitter {
     this.vadThresholds = {
       silenceDuration: 1500, // 1.5 секунды тишины = конец фразы
       minSpeechDuration: 500, // минимум 0.5 сек для валидной речи
-      energyThreshold: 0.01, // порог энергии звука
+      energyThreshold: 0.03, // порог энергии звука
     };
 
     logger.info('🎙️ MediaStreamManager initialized');
@@ -27,14 +24,120 @@ export class MediaStreamManager extends EventEmitter {
   /**
    * 🎯 СОЗДАНИЕ WEBSOCKET СЕРВЕРА для Media Streams
    */
+  // setupWebSocketServer(server) {
+  //   this.wss = new WebSocketServer({
+  //     server,
+  //     path: '/media-stream',
+  //     verifyClient: (info) => {
+  //       // Проверяем что это запрос от Twilio
+  //       const userAgent = info.req.headers['user-agent'];
+  //       return userAgent && userAgent.includes('TwilioProxy');
+  //     },
+  //   });
+
+  //   this.wss.on('connection', (ws, req) => {
+  //     logger.info('🔌 New Media Stream connection from Twilio');
+
+  //     let callId = null;
+  //     let streamSid = null;
+  //     let streamData = null;
+
+  //     ws.on('message', async (message) => {
+  //       try {
+  //         const data = JSON.parse(message);
+
+  //         switch (data.event) {
+  //           case 'start':
+  //             // Извлекаем callId из custom parameters
+  //             callId = data.start.customParameters?.callId;
+  //             streamSid = data.start.streamSid;
+
+  //             if (!callId) {
+  //               logger.error('❌ No callId in stream start event');
+  //               ws.close();
+  //               return;
+  //             }
+
+  //             streamData = this.initializeStream(callId, ws, streamSid);
+  //             logger.info(
+  //               `🎙️ Stream started for call ${callId}, streamSid: ${streamSid}`
+  //             );
+
+  //             // Уведомляем outboundManager
+  //             outboundManager.linkMediaStream(callId, streamSid);
+  //             break;
+
+  //           case 'media':
+  //             if (callId && streamData) {
+  //               await this.handleAudioChunk(callId, data.media);
+  //             }
+  //             break;
+
+  //           case 'stop':
+  //             logger.info(`🎙️ Stream stopped for call: ${callId}`);
+  //             this.cleanupStream(callId);
+  //             break;
+
+  //           default:
+  //             logger.debug(`Unknown stream event: ${data.event}`);
+  //         }
+  //       } catch (error) {
+  //         logger.error('❌ Stream message error:', error);
+  //       }
+  //     });
+
+  //     ws.on('close', () => {
+  //       if (callId) {
+  //         logger.info(`🔌 Media Stream closed for call: ${callId}`);
+  //         this.cleanupStream(callId);
+  //       }
+  //     });
+
+  //     ws.on('error', (error) => {
+  //       logger.error('❌ WebSocket error:', error);
+  //     });
+  //   });
+
+  //   logger.info('🎙️ Media Stream WebSocket server setup complete');
+  // }
+
+  // Замените метод setupWebSocketServer в mediaStreamManager.js на этот:
+
   setupWebSocketServer(server) {
-    this.wss = new WebSocket.Server({
+    this.wss = new WebSocketServer({
       server,
       path: '/media-stream',
       verifyClient: (info) => {
         // Проверяем что это запрос от Twilio
-        const userAgent = info.req.headers['user-agent'];
-        return userAgent && userAgent.includes('TwilioProxy');
+        // const userAgent = info.req.headers['user-agent'];
+        // const isTwilio = userAgent && userAgent.includes('TwilioProxy');
+
+        // if (!isTwilio) {
+        //   logger.warn('⚠️ WebSocket connection rejected - not from Twilio');
+        //   return false;
+        // }
+
+        // Извлекаем callId из URL параметров
+        // const url = new URL(info.req.url, `http://${info.req.headers.host}`);
+        // logger.info(`URL - ${url}`);
+        // const callId = url.searchParams.get('callId');
+
+        // if (!callId) {
+        //   logger.warn('⚠️ WebSocket connection rejected - no callId in URL');
+        //   return false;
+        // }
+
+        // // Проверяем что звонок существует
+        // const callExists = outboundManager.hasActiveCall(callId);
+        // if (!callExists) {
+        //   logger.warn(
+        //     `⚠️ WebSocket connection rejected - call not found: ${callId}`
+        //   );
+        //   return false;
+        // }
+
+        // logger.info(`✅ WebSocket connection accepted for call: ${callId}`);
+        return true;
       },
     });
 
@@ -42,17 +145,53 @@ export class MediaStreamManager extends EventEmitter {
       logger.info('🔌 New Media Stream connection from Twilio');
 
       let callId = null;
+      let streamSid = null;
       let streamData = null;
 
       ws.on('message', async (message) => {
         try {
           const data = JSON.parse(message);
-          await this.handleStreamMessage(callId, data, ws);
 
-          // Сохраняем callId при первом сообщении
-          if (!callId && data.event === 'start') {
-            callId = data.streamSid; // или извлекаем из customParameters
-            streamData = this.initializeStream(callId, ws);
+          switch (data.event) {
+            case 'start':
+              // Извлекаем callId из custom parameters
+              callId = data.start.customParameters?.callId;
+              streamSid = data.start.streamSid;
+
+              // Если callId не в customParameters, пробуем из URL
+              if (!callId && data.start.mediaFormat) {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                callId = url.searchParams.get('callId');
+              }
+
+              if (!callId) {
+                logger.error('❌ No callId in stream start event');
+                ws.close();
+                return;
+              }
+
+              streamData = this.initializeStream(callId, ws, streamSid);
+              logger.info(
+                `🎙️ Stream started for call ${callId}, streamSid: ${streamSid}`
+              );
+
+              // Уведомляем outboundManager
+              outboundManager.linkMediaStream(callId, streamSid);
+              break;
+
+            case 'media':
+              if (callId && streamData && !streamData.isPaused) {
+                await this.handleAudioChunk(callId, data.media);
+              }
+              break;
+
+            case 'stop':
+              logger.info(`🎙️ Stream stopped for call: ${callId}`);
+              this.cleanupStream(callId);
+              break;
+
+            default:
+              logger.debug(`Unknown stream event: ${data.event}`);
           }
         } catch (error) {
           logger.error('❌ Stream message error:', error);
@@ -77,10 +216,11 @@ export class MediaStreamManager extends EventEmitter {
   /**
    * 🎯 ИНИЦИАЛИЗАЦИЯ ПОТОКА для звонка
    */
-  initializeStream(callId, ws) {
+  initializeStream(callId, ws, streamSid) {
     const streamData = {
       callId,
       ws,
+      streamSid,
       startTime: Date.now(),
       lastAudioTime: Date.now(),
       silenceStart: null,
@@ -99,73 +239,72 @@ export class MediaStreamManager extends EventEmitter {
   /**
    * 🎯 ОБРАБОТКА СООБЩЕНИЙ от Twilio Media Stream
    */
-  async handleStreamMessage(callId, data, ws) {
-    switch (data.event) {
-      case 'start':
-        logger.info('🎙️ Stream started:', data.start);
-        // Twilio начал стрим
-        break;
-
-      case 'media':
-        await this.handleAudioChunk(callId, data.media);
-        break;
-
-      case 'stop':
-        logger.info('🎙️ Stream stopped for call:', callId);
-        this.cleanupStream(callId);
-        break;
-    }
-  }
-
-  /**
-   * 🎯 ОБРАБОТКА АУДИО CHUNK в реальном времени
-   */
   async handleAudioChunk(callId, mediaData) {
     const streamData = this.activeStreams.get(callId);
     if (!streamData) return;
 
+    const timestamp = Date.now();
+    const sequenceNumber = parseInt(
+      mediaData.sequenceNumber || mediaData.chunk || -1
+    );
+
+    if (sequenceNumber === -1) {
+      logger.warn(
+        `[handleAudioChunk] ❌ sequenceNumber отсутствует! payload:`,
+        mediaData
+      );
+    }
     // Декодируем μ-law аудио
-    const audioChunk = this.decodeULawAudio(mediaData.payload);
+    const audioBuffer = this.decodeULawAudio(mediaData.payload);
 
-    // Добавляем в буфер
+    // Сохраняем чанк
+    const chunk = {
+      buffer: audioBuffer,
+      timestamp,
+      sequenceNumber,
+    };
+
+    // Обновляем буфер
     const buffer = this.audioBuffers.get(callId) || [];
-    buffer.push({
-      chunk: audioChunk,
-      timestamp: Date.now(),
-      sequence: mediaData.sequenceNumber,
-    });
+    buffer.push(chunk);
 
-    // 🎯 VAD - ДЕТЕКЦИЯ АКТИВНОСТИ ГОЛОСА
-    const energy = this.calculateAudioEnergy(audioChunk);
-    const isSpeech = energy > this.vadThresholds.energyThreshold;
+    logger.debug(
+      `[handleAudioChunk] callId=${callId}, seq=${sequenceNumber}, bufferLen=${audioBuffer.length}`
+    );
 
-    if (isSpeech) {
-      // Речь активна
-      streamData.lastAudioTime = Date.now();
-      streamData.silenceStart = null;
+    // Voice Activity Detection
+    const hasVoice = this.detectVoiceActivity(callId, audioBuffer);
+
+    logger.debug(`[detectVoiceActivity] hasVoice=${hasVoice}`);
+
+    if (hasVoice) {
+      streamData.lastAudioTime = timestamp;
 
       if (!streamData.isCollectingAudio) {
-        logger.info(`🗣️ Speech started for call: ${callId}`);
+        // Начало новой фразы
         streamData.isCollectingAudio = true;
-        streamData.currentPhrase = [];
+        streamData.currentPhrase = [chunk];
+        streamData.silenceStart = null;
+        logger.info(`🗣️ Начало фразы: ${callId}`);
+      } else {
+        logger.debug(
+          `🗣️ Продолжение фразы: ${callId}, chunks=${streamData.currentPhrase.length}`
+        );
+        // Продолжение фразы
+        streamData.currentPhrase.push(chunk);
+        streamData.silenceStart = null;
       }
-
-      streamData.currentPhrase.push({
-        chunk: audioChunk,
-        timestamp: Date.now(),
-      });
     } else {
       // Тишина
-      if (streamData.isCollectingAudio && !streamData.silenceStart) {
-        streamData.silenceStart = Date.now();
-      }
-
-      // Проверяем на конец фразы
-      if (streamData.isCollectingAudio && streamData.silenceStart) {
-        const silenceDuration = Date.now() - streamData.silenceStart;
-
-        if (silenceDuration > this.vadThresholds.silenceDuration) {
-          // Конец фразы!
+      if (streamData.isCollectingAudio) {
+        if (!streamData.silenceStart) {
+          streamData.silenceStart = timestamp;
+        } else if (
+          timestamp - streamData.silenceStart >
+          this.vadThresholds.silenceDuration
+        ) {
+          // Конец фразы
+          logger.info(`🔇 End of speech detected for call: ${callId}`);
           await this.processPhraseComplete(callId);
         }
       }
@@ -208,7 +347,7 @@ export class MediaStreamManager extends EventEmitter {
       // Конвертируем chunks в единый аудио файл
       const audioBuffer = this.combineAudioChunks(phraseAudio);
 
-      // Запускаем STT + LLM + TTS пайплайн
+      // Запускаем обработку
       await this.processStreamingAudio(callId, audioBuffer, duration);
     } catch (error) {
       logger.error(`❌ Phrase processing error for ${callId}:`, error);
@@ -218,156 +357,144 @@ export class MediaStreamManager extends EventEmitter {
   }
 
   /**
-   * 🎯 ОБРАБОТКА ПОТОКОВОГО АУДИО (замена processRecording)
+   * 🎯 ОБРАБОТКА ПОТОКОВОГО АУДИО
    */
   async processStreamingAudio(callId, audioBuffer, duration) {
     const startTime = Date.now();
 
     try {
-      // 1. STT - Whisper в реальном времени
-      const transcription = await this.streamingSTT(audioBuffer);
+      logger.info(
+        `🎤 Processing streaming audio for call: ${callId}, duration: ${duration}s`
+      );
 
-      if (!transcription || transcription.trim().length < 3) {
-        logger.info(`🤫 Empty transcription for call: ${callId}`);
+      // Конвертируем аудио в WAV формат для STT
+      const wavBuffer = this.convertToWav(audioBuffer);
+
+      // Передаем в outboundManager для полной обработки
+      const result = await outboundManager.processStreamingAudio(
+        callId,
+        wavBuffer
+      );
+
+      if (!result || !result.success) {
+        logger.error(`❌ Streaming processing failed for ${callId}`);
         return;
       }
 
-      logger.info(
-        `🎤 Transcribed (${Date.now() - startTime}ms): "${transcription}"`
-      );
-
-      // 2. LLM - классификация и ответ
-      const llmStart = Date.now();
-      const response = await outboundManager.processTranscriptionStreaming(
-        callId,
-        transcription
-      );
-
-      logger.info(
-        `🧠 LLM response (${Date.now() - llmStart}ms): "${response.text}"`
-      );
-
-      // 3. TTS - параллельно с LLM если возможно
-      if (response.text) {
-        const ttsStart = Date.now();
-        await outboundManager.generateResponseTTS(
-          callId,
-          response.text,
-          response.emotion || 'neutral'
-        );
-
-        logger.info(`🔊 TTS generated (${Date.now() - ttsStart}ms)`);
-      }
-
       const totalTime = Date.now() - startTime;
-      logger.info(`⚡ Total streaming processing: ${totalTime}ms`);
+      logger.info(
+        `⚡ Streaming pipeline completed in ${totalTime}ms for ${callId}`
+      );
 
-      // Отправляем аудио-ответ через Twilio
-      await this.sendStreamingResponse(callId);
+      // Эмитим событие для мониторинга
+      this.emit('phrase-processed', {
+        callId,
+        duration,
+        processingTime: totalTime,
+        transcription: result.transcription,
+        response: result.response,
+      });
     } catch (error) {
       logger.error(`❌ Streaming processing error for ${callId}:`, error);
+
+      // Эмитим событие ошибки
+      this.emit('processing-error', {
+        callId,
+        error: error.message,
+      });
     }
   }
 
   /**
-   * 🎯 ПОТОКОВЫЙ STT через Whisper
+   * 🎯 Voice Activity Detection
    */
-  async streamingSTT(audioBuffer) {
-    try {
-      // Конвертируем в формат для Whisper
-      const wavBuffer = this.convertToWav(audioBuffer);
+  // detectVoiceActivity(audioBuffer) {
+  //   if (!audioBuffer || audioBuffer.length === 0) return false;
 
-      // Отправляем в Whisper API
-      const transcription = await outboundManager.transcribeAudio(wavBuffer);
-      return transcription;
-    } catch (error) {
-      logger.error('❌ Streaming STT error:', error);
-      return null;
-    }
-  }
+  //   // Рассчитываем RMS (Root Mean Square) энергию
+  //   let sum = 0;
+  //   for (let i = 0; i < audioBuffer.length; i += 2) {
+  //     if (i + 1 < audioBuffer.length) {
+  //       const sample = audioBuffer.readInt16LE(i);
+  //       sum += sample * sample;
+  //     }
+  //   }
+
+  //   const rms = Math.sqrt(sum / (audioBuffer.length / 2));
+  //   const normalized = rms / 32768; // Нормализуем для 16-bit audio
+
+  //   return normalized > this.vadThresholds.energyThreshold;
+  // }
 
   /**
-   * 🎯 ОТПРАВКА ОТВЕТА через Media Stream
+   * 🎯 Voice Activity Detection с логированием RMS и энергии
    */
-  async sendStreamingResponse(callId) {
-    const streamData = this.activeStreams.get(callId);
-    if (!streamData) return;
-
-    // Проверяем готовое аудио
-    const audioData = outboundManager.pendingAudio.get(callId);
-    if (audioData && audioData.audioUrl && !audioData.consumed) {
-      // Помечаем как использованное
-      audioData.consumed = true;
-      outboundManager.pendingAudio.set(callId, audioData);
-
-      // Отправляем команду Twilio Play через WebSocket
-      const playCommand = {
-        event: 'play',
-        media: {
-          url: audioData.audioUrl,
-        },
-      };
-
-      streamData.ws.send(JSON.stringify(playCommand));
-      logger.info(`🎵 Sent streaming audio response for call: ${callId}`);
+  detectVoiceActivity(callId, audioBuffer) {
+    if (!audioBuffer || audioBuffer.length === 0) {
+      logger.debug(`[VAD] call=${callId} | пустой буфер`);
+      return false;
     }
-  }
-
-  // =================================================================
-  // 🛠️ УТИЛИТЫ для обработки аудио
-  // =================================================================
-
-  calculateAudioEnergy(audioChunk) {
-    if (!audioChunk || audioChunk.length === 0) return 0;
 
     let sum = 0;
-    for (let i = 0; i < audioChunk.length; i++) {
-      sum += Math.abs(audioChunk[i]);
+    for (let i = 0; i < audioBuffer.length; i += 2) {
+      if (i + 1 < audioBuffer.length) {
+        const sample = audioBuffer.readInt16LE(i);
+        sum += sample * sample;
+      }
     }
-    return sum / audioChunk.length / 32768; // нормализация для 16-bit
+
+    const rms = Math.sqrt(sum / (audioBuffer.length / 2));
+    const normalized = rms / 32768; // Нормализация под 16-bit PCM
+    const threshold = this.vadThresholds.energyThreshold;
+    const hasVoice = normalized > threshold;
+
+    logger.debug(
+      `[VAD] call=${callId} | RMS=${rms.toFixed(2)} | norm=${normalized.toFixed(5)} | threshold=${threshold} | hasVoice=${hasVoice}`
+    );
+
+    return hasVoice;
   }
 
-  combineAudioChunks(phraseAudio) {
-    const totalLength = phraseAudio.reduce(
-      (sum, item) => sum + item.chunk.length,
+  /**
+   * 🎯 ОБЪЕДИНЕНИЕ АУДИО ЧАНКОВ
+   */
+  combineAudioChunks(chunks) {
+    const totalLength = chunks.reduce(
+      (sum, chunk) => sum + chunk.buffer.length,
       0
     );
-    const combined = Buffer.alloc(totalLength);
+    const combinedBuffer = Buffer.alloc(totalLength);
 
     let offset = 0;
-    phraseAudio.forEach((item) => {
-      item.chunk.copy(combined, offset);
-      offset += item.chunk.length;
-    });
+    for (const chunk of chunks) {
+      chunk.buffer.copy(combinedBuffer, offset);
+      offset += chunk.buffer.length;
+    }
 
-    return combined;
+    return combinedBuffer;
   }
 
+  /**
+   * 🎯 КОНВЕРТАЦИЯ В WAV ФОРМАТ
+   */
   convertToWav(audioBuffer) {
     try {
-      // 🎯 КОНВЕРТАЦИЯ μ-law PCM в WAV для Whisper
-
-      // Параметры аудио от Twilio Media Streams
-      const sampleRate = 8000; // 8 kHz
-      const numChannels = 1; // моно
-      const bitsPerSample = 16; // 16-bit после декодирования μ-law
-
-      // Размеры для WAV заголовка
-      const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
-      const blockAlign = (numChannels * bitsPerSample) / 8;
+      const sampleRate = 8000;
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+      const blockAlign = numChannels * (bitsPerSample / 8);
       const dataSize = audioBuffer.length;
-      const fileSize = 36 + dataSize;
+      const fileSize = 44 + dataSize;
 
-      // Создаем WAV буфер с заголовком
-      const wavBuffer = Buffer.alloc(44 + dataSize);
+      // Создаем WAV буфер
+      const wavBuffer = Buffer.alloc(fileSize);
       let offset = 0;
 
-      // 🎵 WAV ЗАГОЛОВОК (44 байта)
-
-      // RIFF заголовок
+      // RIFF header
       wavBuffer.write('RIFF', offset);
       offset += 4;
-      wavBuffer.writeUInt32LE(fileSize, offset);
+      wavBuffer.writeUInt32LE(fileSize - 8, offset);
       offset += 4;
       wavBuffer.write('WAVE', offset);
       offset += 4;
@@ -375,10 +502,10 @@ export class MediaStreamManager extends EventEmitter {
       // fmt подчанк
       wavBuffer.write('fmt ', offset);
       offset += 4;
-      wavBuffer.writeUInt32LE(16, offset);
-      offset += 4; // размер fmt chunk
-      wavBuffer.writeUInt16LE(1, offset);
-      offset += 2; // аудио формат (1 = PCM)
+      wavBuffer.writeUInt32LE(16, offset); // размер подчанка
+      offset += 4;
+      wavBuffer.writeUInt16LE(1, offset); // PCM
+      offset += 2;
       wavBuffer.writeUInt16LE(numChannels, offset);
       offset += 2;
       wavBuffer.writeUInt32LE(sampleRate, offset);
@@ -409,7 +536,7 @@ export class MediaStreamManager extends EventEmitter {
   }
 
   /**
-   * 🎯 УЛУЧШЕННОЕ ДЕКОДИРОВАНИЕ μ-law в LINEAR PCM
+   * 🎯 ДЕКОДИРОВАНИЕ μ-law в LINEAR PCM
    */
   decodeULawAudio(base64Payload) {
     try {
@@ -465,6 +592,38 @@ export class MediaStreamManager extends EventEmitter {
     return table;
   }
 
+  /**
+   * Проверка активности потока
+   */
+  hasActiveStream(callId) {
+    return this.activeStreams.has(callId);
+  }
+
+  /**
+   * Получить информацию о потоке
+   */
+  getStreamInfo(callId) {
+    const streamData = this.activeStreams.get(callId);
+    if (!streamData) return null;
+
+    return {
+      callId: streamData.callId,
+      streamSid: streamData.streamSid,
+      isActive: true,
+      uptime: Date.now() - streamData.startTime,
+    };
+  }
+
+  /**
+   * Получить количество активных потоков
+   */
+  getActiveStreamsCount() {
+    return this.activeStreams.size;
+  }
+
+  /**
+   * Сброс сбора фразы
+   */
   resetPhraseCollection(callId) {
     const streamData = this.activeStreams.get(callId);
     if (streamData) {
@@ -474,7 +633,19 @@ export class MediaStreamManager extends EventEmitter {
     }
   }
 
+  /**
+   * Очистка ресурсов потока
+   */
   cleanupStream(callId) {
+    const streamData = this.activeStreams.get(callId);
+    if (streamData && streamData.ws) {
+      try {
+        streamData.ws.close();
+      } catch (error) {
+        logger.error(`Error closing WebSocket for ${callId}:`, error);
+      }
+    }
+
     this.activeStreams.delete(callId);
     this.audioBuffers.delete(callId);
     logger.info(`🧹 Stream cleanup complete for call: ${callId}`);

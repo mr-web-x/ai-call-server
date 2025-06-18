@@ -196,8 +196,8 @@ async function startServer() {
     logger.info('✅ Database connected successfully');
 
     // Initialize WebSocket
-    setupWebSocket(server);
-    logger.info('✅ WebSocket server initialized');
+    // setupWebSocket(server);
+    // logger.info('✅ WebSocket server initialized');
 
     // Media Stream Manager init
     mediaStreamManager.setupWebSocketServer(server);

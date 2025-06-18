@@ -10,7 +10,8 @@ import { logger } from '../utils/logger.js';
 import { CONFIG } from '../config/index.js';
 import { whisperDetector } from '../utils/whisperHallucinationDetector.js';
 import { silenceHandler } from './silenceHandler.js';
-import { ttsQueue } from '../queues/setup.js';
+import { mediaStreamManager } from './mediaStreamManager.js';
+import { sttQueue, llmQueue, ttsQueue } from '../queues/setup.js';
 
 // 🔧 ИСПРАВЛЕНИЕ: Используем ваш существующий Twilio конфиг
 import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
@@ -18,6 +19,7 @@ import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
 import axios from 'axios';
 
 export class OutboundManager {
+  // super();
   constructor() {
     this.activeCalls = new Map(); // callId -> callData
     this.pendingAudio = new Map(); // callId -> audioData
@@ -28,6 +30,10 @@ export class OutboundManager {
 
     // 🔧 ИСПРАВЛЕНИЕ: Используем уже созданный twilioClient
     this.twilioClient = twilioClient;
+
+    this.pendingTwiml = new Map(); // callId -> pending TwiML
+    this.streamingMetrics = new Map(); // callId -> latency metrics
+    this.isStreamingEnabled = process.env.ENABLE_MEDIA_STREAMS === 'true';
 
     logger.info('🏗️ OutboundCallManager initialized');
   }
@@ -816,107 +822,246 @@ export class OutboundManager {
   }
 
   /**
-   * Генерация TwiML ответа
+   * Получить pending audio для звонка
    */
-  generateTwiML(callId, context = 'initial') {
+  getPendingAudio(callId) {
+    return this.pendingAudio.get(callId);
+  }
+
+  /**
+   * Проверить есть ли pending audio
+   */
+  hasPendingAudio(callId) {
+    const audio = this.pendingAudio.get(callId);
+    return audio && !audio.consumed;
+  }
+
+  /**
+   * Связать Media Stream с звонком
+   */
+  linkMediaStream(callId, streamSid) {
+    const callData = this.activeCalls.get(callId);
+    if (callData) {
+      callData.streamSid = streamSid;
+      logger.info(`🔗 Linked media stream ${streamSid} to call ${callId}`);
+    }
+  }
+
+  hasActiveCall(callId) {
+    return this.activeCalls.has(callId);
+  }
+
+  /**
+   * ОБНОВЛЕННЫЙ generateTwiML для правильной передачи callId в Stream
+   */
+  generateTwiML(callId, type = 'initial') {
     const callData = this.activeCalls.get(callId);
     if (!callData) {
-      logger.error(`Call data not found for TwiML generation: ${callId}`);
-      return this.generateErrorTwiML(); // ✅ ЭТО УЖЕ ЕСТЬ!
+      logger.error(`No call data for TwiML generation: ${callId}`);
+      return this.generateErrorTwiML();
     }
 
-    // 🎯 ПОЛУЧАЕМ ТЕКУЩУЮ СТАДИЮ
-    const stageData = this.getConversationStage(callId);
-    const currentStage = stageData?.stage || 'start';
+    const webhookUrl = `${process.env.SERVER_URL}/api/webhooks`;
+    const voice = 'Polly.Tatyana';
 
-    logger.info(`🎭 TwiML for ${callId}, stage: ${currentStage}`);
+    // Проверяем включен ли streaming
+    const isStreamingEnabled = process.env.ENABLE_MEDIA_STREAMS === 'true';
 
-    //     // 🎯 ПРОВЕРЯЕМ СТАДИЮ ОЖИДАНИЯ
-    //     if (currentStage === 'greeting_sent' || currentStage === 'response_sent') {
-    //       const timeSinceStage = Date.now() - stageData.timestamp;
+    let twiml = '<?xml version="1.0" encoding="UTF-8"?><Response>';
 
-    //       // Если недавно отправили - просто ждем
-    //       if (timeSinceStage < 30000) {
-    //         // 30 секунд
-    //         logger.info(
-    //           `⏳ Still waiting for response on ${callId} (${Math.round(timeSinceStage / 1000)}s)`
-    //         );
+    // Включаем Media Streams если включено
+    if (isStreamingEnabled && type === 'initial') {
+      const streamUrl =
+        process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
 
-    //         // Возвращаем простой Record без аудио
-    //         return `<?xml version="1.0" encoding="UTF-8"?>
-    // <Response>
-    //     <Record
-    //         action="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording/${callId}"
-    //         method="POST"
-    //         maxLength="60"
-    //         playBeep="false"
-    //         timeout="5"
-    //         finishOnKey="#"
-    //         trim="trim-silence"
-    //         recordingStatusCallback="${TWILIO_CONFIG.serverUrl}/api/webhooks/recording-status/${callId}"
-    //     />
-    // </Response>`;
-    //       }
-    //     }
+      // ВАЖНО: передаем callId через customParameters
+      twiml += `<Start>
+      <Stream url="${streamUrl}" track="outbound">
+        <Parameter name="callId" value="${callId}" />
+        <Parameter name="twilioSid" value="${callData.twilioSid || callData.twilioCallSid}" />
+      </Stream>
+    </Start>`;
+    }
 
-    // 🎯 ОБЫЧНАЯ ЛОГИКА (существующая)
-    // logger.info(`🎯 Generating TwiML for call: ${callId}, context: ${context}`);
+    // Проверяем pending audio
+    const pendingAudio = this.pendingAudio.get(callId);
 
-    // Проверяем готовое аудио
-    const audioData = this.pendingAudio.get(callId);
-    logger.info(`🔍 Checking pendingAudio for ${callId}:`, {
-      hasAudioData: !!audioData,
-      audioType: audioData?.type || 'none',
-      consumed: audioData?.consumed || false,
-      audioUrl: audioData?.audioUrl ? 'present' : 'missing',
-    });
-
-    if (audioData && !audioData.consumed) {
-      logger.info(`🎵 Using ready audio for call: ${callId}`);
-
-      // Помечаем как использованное
-      audioData.consumed = true;
-      this.pendingAudio.set(callId, audioData);
-
-      // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ
-      if (currentStage === 'start') {
-        this.setConversationStage(callId, 'greeting_sent', {
-          audioUrl: audioData.audioUrl,
-          source: audioData.source,
-        });
+    if (pendingAudio && !pendingAudio.consumed) {
+      // Воспроизводим аудио
+      if (pendingAudio.audioUrl) {
+        twiml += `<Play>${pendingAudio.audioUrl}</Play>`;
+        logger.info(`🎵 Playing audio: ${pendingAudio.audioUrl}`);
       } else {
-        // silence_response, conversation, response - все как обычный ответ
-        this.setConversationStage(callId, 'response_sent', {
-          audioUrl: audioData.audioUrl,
-          source: audioData.source,
-        });
+        const text = pendingAudio.text || 'Здравствуйте';
+        twiml += `<Say voice="${voice}" language="ru-RU">${text}</Say>`;
       }
 
-      if (audioData.audioUrl) {
-        logger.info(`🎵 Sending ElevenLabs PLAY TwiML for call: ${callId}`);
-        logger.info(`🎵 Audio URL: ${audioData.audioUrl}`);
-        return this.generatePlayTwiML(callId, audioData.audioUrl); // ✅ ЭТО УЖЕ ЕСТЬ!
-      }
+      pendingAudio.consumed = true;
     }
 
-    // 🎯 ОБНОВЛЕННЫЙ FALLBACK (существующая логика)
-    const script = DebtCollectionScripts.getScript(
-      callData.currentStage || 'start',
-      'positive',
-      callData.session.clientData
+    // Для streaming используем Pause вместо Record
+    if (isStreamingEnabled) {
+      twiml += `<Pause length="30"/>`;
+      twiml += `<Redirect>${webhookUrl}/continue/${callId}</Redirect>`;
+    } else {
+      // Fallback на старый Record API
+      twiml += `<Record
+      action="${webhookUrl}/recording/${callId}"
+      recordingStatusCallback="${webhookUrl}/recording-status/${callId}"
+      timeout="3"
+      maxLength="30"
+      finishOnKey="#"
+      playBeep="false"
+      trim="trim-silence"
+    />`;
+      twiml += `<Redirect>${webhookUrl}/continue/${callId}</Redirect>`;
+    }
+
+    twiml += '</Response>';
+
+    logger.info(
+      `📋 Generated ${isStreamingEnabled ? 'STREAMING' : 'RECORDING'} TwiML for ${callId}`
     );
-
-    logger.warn(`⚠️ No audio ready for call: ${callId}, using fallback TTS`);
-
-    // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ ДЛЯ FALLBACK
-    if (currentStage === 'start') {
-      this.setConversationStage(callId, 'greeting_sent', {
-        source: 'twilio_fallback',
-      });
-    }
-
-    return this.generateSayTwiML(callId, script.text, 'Polly.Maxim'); // ✅ Изменили голос на мужской
+    return twiml;
   }
+
+  /**
+   * Генерация TwiML ответа
+   */
+  // generateTwiML(callId, type = 'initial') {
+  //   const callData = this.activeCalls.get(callId);
+  //   if (!callData) {
+  //     logger.error(`No call data for TwiML generation: ${callId}`);
+  //     return this.generateErrorTwiML();
+  //   }
+
+  //   const webhookUrl = `${process.env.SERVER_URL}/api/webhooks`;
+  //   const voice = 'Polly.Tatyana';
+
+  //   let twiml = '<?xml version="1.0" encoding="UTF-8"?><Response>';
+
+  //   // Включаем Media Streams если включено
+  //   if (this.isStreamingEnabled && type === 'initial') {
+  //     const streamUrl =
+  //       process.env.SERVER_URL.replace('https://', 'wss://') + '/media-stream';
+
+  //     twiml += `<Start>
+  //       <Stream url="${streamUrl}">
+  //         <Parameter name="callId" value="${callId}" />
+  //         <Parameter name="twilioSid" value="${callData.twilioSid}" />
+  //       </Stream>
+  //     </Start>`;
+  //   }
+
+  //   // Проверяем pending audio
+  //   const pendingAudio = this.pendingAudio.get(callId);
+
+  //   if (pendingAudio && !pendingAudio.consumed) {
+  //     // Воспроизводим аудио
+  //     if (pendingAudio.audioUrl) {
+  //       twiml += `<Play>${pendingAudio.audioUrl}</Play>`;
+  //     } else {
+  //       const text = pendingAudio.text || 'Здравствуйте';
+  //       twiml += `<Say voice="${voice}" language="ru-RU">${text}</Say>`;
+  //     }
+
+  //     pendingAudio.consumed = true;
+  //   }
+
+  //   // Для streaming используем Pause вместо Record
+  //   if (this.isStreamingEnabled) {
+  //     twiml += `<Pause length="30"/>`;
+  //     twiml += `<Redirect>${webhookUrl}/continue/${callId}</Redirect>`;
+  //   } else {
+  //     // Fallback на старый Record API
+  //     twiml += `<Record
+  //       action="${webhookUrl}/recording/${callId}"
+  //       recordingStatusCallback="${webhookUrl}/recording-status/${callId}"
+  //       timeout="3"
+  //       maxLength="30"
+  //       finishOnKey="#"
+  //       playBeep="false"
+  //       trim="trim-silence"
+  //     />`;
+  //     twiml += `<Redirect>${webhookUrl}/continue/${callId}</Redirect>`;
+  //   }
+
+  //   twiml += '</Response>';
+
+  //   logger.info(
+  //     `📋 Generated ${this.isStreamingEnabled ? 'STREAMING' : 'RECORDING'} TwiML for ${callId}`
+  //   );
+  //   return twiml;
+  // }
+
+  // generateTwiML(callId, context = 'initial') {
+  //   const callData = this.activeCalls.get(callId);
+  //   if (!callData) {
+  //     logger.error(`Call data not found for TwiML generation: ${callId}`);
+  //     return this.generateErrorTwiML(); // ✅ ЭТО УЖЕ ЕСТЬ!
+  //   }
+
+  //   // 🎯 ПОЛУЧАЕМ ТЕКУЩУЮ СТАДИЮ
+  //   const stageData = this.getConversationStage(callId);
+  //   const currentStage = stageData?.stage || 'start';
+
+  //   logger.info(`🎭 TwiML for ${callId}, stage: ${currentStage}`);
+
+  //   // Проверяем готовое аудио
+  //   const audioData = this.pendingAudio.get(callId);
+  //   logger.info(`🔍 Checking pendingAudio for ${callId}:`, {
+  //     hasAudioData: !!audioData,
+  //     audioType: audioData?.type || 'none',
+  //     consumed: audioData?.consumed || false,
+  //     audioUrl: audioData?.audioUrl ? 'present' : 'missing',
+  //   });
+
+  //   if (audioData && !audioData.consumed) {
+  //     logger.info(`🎵 Using ready audio for call: ${callId}`);
+
+  //     // Помечаем как использованное
+  //     audioData.consumed = true;
+  //     this.pendingAudio.set(callId, audioData);
+
+  //     // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ
+  //     if (currentStage === 'start') {
+  //       this.setConversationStage(callId, 'greeting_sent', {
+  //         audioUrl: audioData.audioUrl,
+  //         source: audioData.source,
+  //       });
+  //     } else {
+  //       // silence_response, conversation, response - все как обычный ответ
+  //       this.setConversationStage(callId, 'response_sent', {
+  //         audioUrl: audioData.audioUrl,
+  //         source: audioData.source,
+  //       });
+  //     }
+
+  //     if (audioData.audioUrl) {
+  //       logger.info(`🎵 Sending ElevenLabs PLAY TwiML for call: ${callId}`);
+  //       logger.info(`🎵 Audio URL: ${audioData.audioUrl}`);
+  //       return this.generatePlayTwiML(callId, audioData.audioUrl); // ✅ ЭТО УЖЕ ЕСТЬ!
+  //     }
+  //   }
+
+  //   // 🎯 ОБНОВЛЕННЫЙ FALLBACK (существующая логика)
+  //   const script = DebtCollectionScripts.getScript(
+  //     callData.currentStage || 'start',
+  //     'positive',
+  //     callData.session.clientData
+  //   );
+
+  //   logger.warn(`⚠️ No audio ready for call: ${callId}, using fallback TTS`);
+
+  //   // 🎯 УСТАНАВЛИВАЕМ СТАДИЮ ДЛЯ FALLBACK
+  //   if (currentStage === 'start') {
+  //     this.setConversationStage(callId, 'greeting_sent', {
+  //       source: 'twilio_fallback',
+  //     });
+  //   }
+
+  //   return this.generateSayTwiML(callId, script.text, 'Polly.Maxim'); // ✅ Изменили голос на мужской
+  // }
 
   /**
    * Генерация Play TwiML для ElevenLabs
@@ -945,6 +1090,195 @@ export class OutboundManager {
     logger.info(twiml);
 
     return twiml;
+  }
+
+  async processTranscriptionStreaming(callId, transcription) {
+    const callData = this.activeCalls.get(callId);
+    if (!callData) {
+      logger.error(
+        `Cannot process transcription: call data not found for ${callId}`
+      );
+      return null;
+    }
+
+    try {
+      logger.info(`📝 Processing streaming transcription: "${transcription}"`);
+
+      // Получаем текущее состояние
+      const currentStage = callData.currentStage || 'initial';
+      const conversationHistory = callData.conversationHistory || [];
+
+      // Классификация
+      const classificationResult = await classificationService.classifyMessage(
+        transcription,
+        callData.clientData,
+        currentStage,
+        conversationHistory
+      );
+
+      const classification = classificationResult.classification || 'neutral';
+      const repeatCount = this.updateClassificationTracker(
+        callId,
+        classification
+      );
+
+      // Обновляем историю
+      conversationHistory.push(transcription);
+      callData.conversationHistory = conversationHistory;
+
+      // Генерация ответа
+      const responseResult = await responseGenerator.generateResponse({
+        callId,
+        clientData: callData.clientData,
+        clientMessage: transcription,
+        classification,
+        conversationHistory,
+        currentStage,
+        repeatCount,
+      });
+
+      if (!responseResult.success) {
+        throw new Error(`Response generation failed: ${responseResult.error}`);
+      }
+
+      // Обновляем историю и стадию
+      conversationHistory.push(responseResult.response);
+      callData.conversationHistory = conversationHistory;
+      callData.currentStage = responseResult.nextStage;
+
+      return {
+        text: responseResult.response,
+        classification,
+        nextStage: responseResult.nextStage,
+        emotion: responseResult.emotion || 'neutral',
+      };
+    } catch (error) {
+      logger.error(`❌ Transcription processing error for ${callId}:`, error);
+      return {
+        text: 'Извините, не могу обработать ваше сообщение. Повторите пожалуйста.',
+        classification: 'error',
+        emotion: 'apologetic',
+      };
+    }
+  }
+
+  /**
+   * Вспомогательный метод для сохранения хода разговора
+   */
+  async saveConversationTurn(callId, turnData) {
+    try {
+      await Call.findOneAndUpdate(
+        { call_id: callId },
+        {
+          $push: {
+            conversation_turns: {
+              timestamp: new Date(),
+              user_message: turnData.userMessage,
+              classification: turnData.classification,
+              ai_response: turnData.aiResponse,
+              next_stage: turnData.nextStage,
+              processing_time: turnData.processingTime,
+              is_streaming: turnData.isStreaming,
+            },
+          },
+          current_stage: turnData.nextStage,
+          updated_at: new Date(),
+        }
+      );
+    } catch (error) {
+      logger.error(`Failed to save conversation turn for ${callId}:`, error);
+    }
+  }
+
+  async processStreamingAudio(callId, audioBuffer) {
+    const startTime = Date.now();
+    this.streamingMetrics.set(callId, { startTime });
+
+    const callData = this.activeCalls.get(callId);
+    if (!callData) {
+      logger.error(`No call data for streaming audio: ${callId}`);
+      return;
+    }
+
+    try {
+      // 1. Speech-to-Text
+      const sttStart = Date.now();
+      const transcription = await sttService.transcribe({
+        audioBuffer,
+        language: 'ru-RU',
+        format: 'wav',
+      });
+
+      const sttDuration = Date.now() - sttStart;
+      logger.info(`🎤 STT completed in ${sttDuration}ms: "${transcription}"`);
+
+      if (!transcription || transcription.trim().length < 3) {
+        logger.info(`🤫 Empty transcription, ignoring`);
+        return;
+      }
+
+      // 2. Обработка через AI
+      const aiStart = Date.now();
+      const aiResponse = await this.processTranscriptionStreaming(
+        callId,
+        transcription
+      );
+
+      const aiDuration = Date.now() - aiStart;
+      logger.info(`🧠 AI response in ${aiDuration}ms: "${aiResponse.text}"`);
+
+      // 3. Обновляем историю разговора
+      callData.session.turns.push({
+        user: transcription,
+        assistant: aiResponse.text,
+        classification: aiResponse.classification,
+        timestamp: new Date(),
+      });
+
+      // 4. Генерация TTS
+      const ttsStart = Date.now();
+      await this.generateResponseTTS(
+        callId,
+        aiResponse.text,
+        aiResponse.priority || 'normal',
+        aiResponse.type
+      );
+
+      const ttsDuration = Date.now() - ttsStart;
+      const totalDuration = Date.now() - startTime;
+
+      // 5. Логируем метрики
+      logger.info(`⏱️ Streaming processing metrics for ${callId}:`, {
+        stt: `${sttDuration}ms`,
+        ai: `${aiDuration}ms`,
+        tts: `${ttsDuration}ms`,
+        total: `${totalDuration}ms`,
+      });
+
+      // 6. Триггерим webhook update если нужно воспроизвести аудио
+      this.triggerPlayback(callId);
+    } catch (error) {
+      logger.error(`❌ Streaming processing error for ${callId}:`, error);
+
+      // Fallback ответ при ошибке
+      await this.generateResponseTTS(
+        callId,
+        'Извините, произошла техническая ошибка. Повторите пожалуйста.',
+        'urgent'
+      );
+    }
+  }
+
+  /**
+   *  Триггер воспроизведения через webhook
+   */
+  triggerPlayback(callId) {
+    const callData = this.activeCalls.get(callId);
+    if (!callData || !callData.twilioSid) return;
+
+    // Отправляем сигнал Twilio для обновления звонка
+    // Это вызовет webhook /continue/:callId где мы вернем TwiML с audio
+    this.emit('playback-ready', { callId, twilioSid: callData.twilioSid });
   }
 
   /**
@@ -1059,6 +1393,12 @@ export class OutboundManager {
     this.pendingAudio.delete(callId);
     this.conversationStages.delete(callId);
 
+    if (this.isStreamingEnabled) {
+      mediaStreamManager.cleanupStream(callId);
+      this.streamingMetrics.delete(callId);
+      this.pendingTwiml.delete(callId);
+    }
+
     // Сохраняем финальные данные
     try {
       await Call.findOneAndUpdate(
@@ -1144,6 +1484,190 @@ export class OutboundManager {
 
     logger.warn(`⚠️ CallId not found for Twilio SID: ${twilioSid}`);
     return null;
+  }
+
+  /**
+   * Обработка streaming аудио (аналог processRecording для потоков)
+   */
+  async processStreamingAudio(callId, audioBuffer) {
+    const callData = this.activeCalls.get(callId);
+    if (!callData) {
+      logger.error(
+        `Cannot process streaming audio: call data not found for ${callId}`
+      );
+      return null;
+    }
+
+    // Устанавливаем флаг обработки
+    this.setRecordingProcessing(callId, true);
+
+    try {
+      const startTime = Date.now();
+      logger.info(`🎤 Starting streaming audio processing for call: ${callId}`);
+
+      // 1️⃣ SPEECH-TO-TEXT
+      const sttStart = Date.now();
+
+      // Создаем job для STT
+      const sttJob = await sttQueue.add('transcribe', {
+        audioBuffer,
+        callId,
+        format: 'wav',
+        language: 'ru-RU',
+      });
+
+      const sttResult = await sttJob.finished();
+
+      if (!sttResult || !sttResult.transcription) {
+        throw new Error('STT failed or returned empty result');
+      }
+
+      const transcription = sttResult.transcription.trim();
+      const sttDuration = Date.now() - sttStart;
+
+      logger.info(`📝 STT completed in ${sttDuration}ms: "${transcription}"`);
+
+      // Проверяем на пустую транскрипцию
+      if (transcription.length < 3) {
+        logger.info(`🤫 Empty or too short transcription, ignoring`);
+        return null;
+      }
+
+      // 2️⃣ КЛАССИФИКАЦИЯ И ГЕНЕРАЦИЯ ОТВЕТА
+      const llmStart = Date.now();
+
+      // Получаем историю разговора
+      const currentStage = callData.currentStage || 'initial';
+      const conversationHistory = callData.conversationHistory || [];
+
+      // Классифицируем сообщение
+      const classificationJob = await llmQueue.add('classifyMessage', {
+        message: transcription,
+        callId,
+        clientData: callData.clientData,
+        currentStage,
+        conversationHistory,
+      });
+
+      const classificationResult = await classificationJob.finished();
+      const classification = classificationResult.classification || 'neutral';
+
+      logger.info(`🏷️ Classification: ${classification}`);
+
+      // Обновляем счетчик классификаций
+      const repeatCount = this.updateClassificationTracker(
+        callId,
+        classification
+      );
+
+      // Обновляем историю разговора
+      conversationHistory.push(transcription);
+      callData.conversationHistory = conversationHistory;
+
+      // 3️⃣ ГЕНЕРАЦИЯ ОТВЕТА
+      const responseJob = await llmQueue.add('generateResponse', {
+        responseContext: {
+          callId,
+          clientData: callData.clientData,
+          clientMessage: transcription,
+          classification,
+          conversationHistory,
+          currentStage,
+          repeatCount,
+        },
+      });
+
+      const responseResult = await responseJob.finished();
+
+      if (!responseResult || !responseResult.success) {
+        throw new Error(
+          `Response generation failed: ${responseResult?.error || 'Unknown error'}`
+        );
+      }
+
+      const llmDuration = Date.now() - llmStart;
+      logger.info(`🧠 LLM processing completed in ${llmDuration}ms`);
+
+      // Добавляем ответ в историю
+      conversationHistory.push(responseResult.response);
+      callData.conversationHistory = conversationHistory;
+
+      // Обновляем стадию разговора
+      if (responseResult.nextStage) {
+        callData.currentStage = responseResult.nextStage;
+      }
+
+      // 4️⃣ ГЕНЕРАЦИЯ TTS
+      const ttsStart = Date.now();
+
+      await this.generateResponseTTS(
+        callId,
+        responseResult.response,
+        'urgent', // Для streaming используем urgent приоритет
+        'streaming'
+      );
+
+      const ttsDuration = Date.now() - ttsStart;
+      const totalDuration = Date.now() - startTime;
+
+      // 5️⃣ ЛОГИРОВАНИЕ МЕТРИК
+      logger.info(`⏱️ Streaming processing metrics for ${callId}:`, {
+        stt: `${sttDuration}ms`,
+        llm: `${llmDuration}ms`,
+        tts: `${ttsDuration}ms`,
+        total: `${totalDuration}ms`,
+        transcription: transcription.substring(0, 50) + '...',
+        response: responseResult.response.substring(0, 50) + '...',
+      });
+
+      // 6️⃣ СОХРАНЕНИЕ В БД (асинхронно)
+      this.saveConversationTurn(callId, {
+        userMessage: transcription,
+        classification,
+        aiResponse: responseResult.response,
+        nextStage: responseResult.nextStage,
+        processingTime: totalDuration,
+        isStreaming: true,
+      }).catch((error) => {
+        logger.error(`Failed to save conversation turn: ${error}`);
+      });
+
+      return {
+        success: true,
+        transcription,
+        classification,
+        response: responseResult.response,
+        nextStage: responseResult.nextStage,
+        metrics: {
+          stt: sttDuration,
+          llm: llmDuration,
+          tts: ttsDuration,
+          total: totalDuration,
+        },
+      };
+    } catch (error) {
+      logger.error(`❌ Streaming audio processing error for ${callId}:`, error);
+
+      // Генерируем fallback ответ
+      try {
+        await this.generateResponseTTS(
+          callId,
+          'Извините, произошла техническая ошибка. Повторите пожалуйста.',
+          'urgent',
+          'error'
+        );
+      } catch (ttsError) {
+        logger.error(`Failed to generate error TTS: ${ttsError}`);
+      }
+
+      return {
+        success: false,
+        error: error.message,
+      };
+    } finally {
+      // Снимаем флаг обработки
+      this.setRecordingProcessing(callId, false);
+    }
   }
 
   /**
@@ -1325,6 +1849,29 @@ export class OutboundManager {
     } else {
       this.recordingProcessing.delete(callId);
       logger.info(`✅ Removed processing marker for call: ${callId}`);
+    }
+  }
+
+  /**
+   * НОВЫЙ: Получить pending TwiML для continue webhook
+   */
+  getPendingTwiml(callId) {
+    const twiml = this.pendingTwiml.get(callId);
+    if (twiml) {
+      this.pendingTwiml.delete(callId);
+      return twiml;
+    }
+    return null;
+  }
+
+  /**
+   * НОВЫЙ: Метод для связи с mediaStreamManager
+   */
+  linkMediaStream(callId, streamSid) {
+    const callData = this.activeCalls.get(callId);
+    if (callData) {
+      callData.streamSid = streamSid;
+      logger.info(`🔗 Linked media stream ${streamSid} to call ${callId}`);
     }
   }
 

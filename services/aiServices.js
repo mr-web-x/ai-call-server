@@ -298,7 +298,7 @@ export class AIServices {
         max_tokens: maxTokens,
         temperature,
         // timeout: CONFIG.GPT_TIMEOUT_RESPONSE || 15000,
-        stop: ['\n\n', 'Клиент:', 'Ростик:'], // Остановочные токены
+        stop: ['\n\n', 'Клиент:', 'МИИИхал:'], // Остановочные токены
       });
 
       const processingTime = Date.now() - startTime;
@@ -442,7 +442,7 @@ export class AIServices {
     }
 
     // Проверка структуры (не должно быть диалогов)
-    if (/Клиент:|Ростик:|AI:|GPT:/.test(text)) {
+    if (/Клиент:|МИИИхал:|AI:|GPT:/.test(text)) {
       return {
         isValid: false,
         reason: 'Contains dialogue structure',

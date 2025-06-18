@@ -48,17 +48,17 @@ export class DebtCollectionScripts {
       start: {
         positive: [
           {
-            text: 'Добрый день! Меня зовут Ростик, я представляю компанию {company}. Могу ли я говорить с {clientName}?',
+            text: 'Добрый день! Меня зовут МИИИхал, я представляю компанию {company}. Могу ли я говорить с {clientName}?',
             nextStage: 'identification',
             priority: 'normal',
           },
           {
-            text: 'Здравствуйте! Это Ростик из {company}. Вы {clientName}?',
+            text: 'Здравствуйте! Это МИИИхал из {company}. Вы {clientName}?',
             nextStage: 'identification',
             priority: 'normal',
           },
           {
-            text: 'Добро пожаловать! Меня зовут Ростик, звоню из компании {company}. Я правильно дозвонился до {clientName}?',
+            text: 'Добро пожаловать! Меня зовут МИИИхал, звоню из компании {company}. Я правильно дозвонился до {clientName}?',
             nextStage: 'identification',
             priority: 'normal',
           },
@@ -77,7 +77,7 @@ export class DebtCollectionScripts {
         ],
         neutral: [
           {
-            text: 'Здравствуйте! Меня зовут Ростик. Я правильно дозвонился до {clientName}?',
+            text: 'Здравствуйте! Меня зовут МИИИхал. Я правильно дозвонился до {clientName}?',
             nextStage: 'identification',
             priority: 'normal',
           },
