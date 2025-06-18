@@ -8,6 +8,7 @@ import { CONFIG } from './config/index.js';
 import { connectDatabase } from './config/database.js';
 import { setupWebSocket } from './websocket.js';
 import { logger } from './utils/logger.js';
+import { mediaStreamManager } from './services/mediaStreamManager.js';
 
 // Import queue processors to initialize them
 import './queues/processors.js';
@@ -197,6 +198,10 @@ async function startServer() {
     // Initialize WebSocket
     setupWebSocket(server);
     logger.info('✅ WebSocket server initialized');
+
+    // Media Stream Manager init
+    mediaStreamManager.setupWebSocketServer(server);
+    logger.info('✅ Media Stream Manager initialized');
 
     // Initialize audio directories
     await audioManager.ensureDirectories();

@@ -1,8 +1,6 @@
 import express from 'express';
-import axios from 'axios';
 import { outboundManager } from '../services/outboundManager.js';
 import { Call } from '../models/Call.js';
-import { ttsQueue } from '../queues/setup.js';
 import { logger } from '../utils/logger.js';
 
 const router = express.Router();
@@ -135,14 +133,6 @@ router.post('/recording/:callId', async (req, res) => {
   });
 
   try {
-    // 🔥 КРИТИЧНО: Сразу отвечаем Twilio что webhook получен
-    //     res.status(200).type('text/xml')
-    //       .send(`<?xml version="1.0" encoding="UTF-8"?>
-    // <Response>
-    //     <Pause length="1"/>
-    //     <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
-    // </Response>`);
-
     // ✅ ПРОВЕРКА НА ДВОЙНУЮ ОБРАБОТКУ (ТОЛЬКО ПРОВЕРКА, НЕ УСТАНОВКА)
     if (outboundManager.recordingProcessing.has(callId)) {
       const existingTimestamp = outboundManager.recordingProcessing.get(callId);
@@ -244,8 +234,6 @@ router.post('/recording/:callId', async (req, res) => {
     if (result && result.success) {
       // ✅ ОБРАБОТКА УСПЕШНА
       const audioData = outboundManager.pendingAudio.get(callId);
-
-      
 
       if (audioData && audioData.audioUrl) {
         logger.info(
