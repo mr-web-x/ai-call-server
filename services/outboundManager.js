@@ -10,6 +10,7 @@ import { logger } from '../utils/logger.js';
 import { CONFIG } from '../config/index.js';
 import { whisperDetector } from '../utils/whisperHallucinationDetector.js';
 import { silenceHandler } from './silenceHandler.js';
+import { ttsQueue } from '../queues/setup.js';
 
 // 🔧 ИСПРАВЛЕНИЕ: Используем ваш существующий Twilio конфиг
 import { twilioClient, TWILIO_CONFIG } from '../config/twilio.js';
@@ -574,14 +575,16 @@ export class OutboundManager {
         `🎵 Generating TTS for response: "${responseResult.response}"`
       );
 
-      const ttsResult = await ttsManager.synthesizeSpeech(
-        responseResult.response,
-        {
-          priority: 'normal',
-          voiceId: process.env.TTS_VOICE_ID,
-          useCache: true,
-        }
-      );
+      const ttsJob = await ttsQueue.add('synthesize', {
+        text: responseResult.response,
+        callId: callId,
+        priority: 'normal',
+        type: 'conversation',
+        voiceId: process.env.TTS_VOICE_ID,
+        useCache: true,
+      });
+
+      const ttsResult = await ttsJob.finished();
 
       if (ttsResult && (ttsResult.audioUrl || ttsResult.audioBuffer)) {
         this.pendingAudio.set(callId, {

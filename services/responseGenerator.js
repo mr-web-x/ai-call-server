@@ -70,11 +70,12 @@ export class ResponseGenerator {
       });
 
       return {
-        text: validatedResponse.text,
+        response: validatedResponse.text,
         nextStage: validatedResponse.nextStage,
         method: responseMethod,
         isValid: validatedResponse.isValid,
         metrics: this.getMetrics(),
+        success: true,
       };
     } catch (error) {
       logger.error(`❌ Response generation failed for call ${callId}:`, error);
@@ -425,7 +426,8 @@ export class ResponseGenerator {
     const { classification } = context;
 
     return {
-      text: this.getFallbackPhrase(classification),
+      success: true,
+      response: this.getFallbackPhrase(classification),
       nextStage: 'listening',
       method: 'fallback',
       isValid: true,

@@ -136,12 +136,12 @@ router.post('/recording/:callId', async (req, res) => {
 
   try {
     // 🔥 КРИТИЧНО: Сразу отвечаем Twilio что webhook получен
-    res.status(200).type('text/xml')
-      .send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Pause length="1"/>
-    <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
-</Response>`);
+    //     res.status(200).type('text/xml')
+    //       .send(`<?xml version="1.0" encoding="UTF-8"?>
+    // <Response>
+    //     <Pause length="1"/>
+    //     <Redirect method="POST">${process.env.SERVER_URL}/api/webhooks/twiml</Redirect>
+    // </Response>`);
 
     // ✅ ПРОВЕРКА НА ДВОЙНУЮ ОБРАБОТКУ (ТОЛЬКО ПРОВЕРКА, НЕ УСТАНОВКА)
     if (outboundManager.recordingProcessing.has(callId)) {
@@ -232,26 +232,83 @@ router.post('/recording/:callId', async (req, res) => {
       return;
     }
 
-    logger.info(`✅ Recording validation passed for call: ${callId}`, {
-      duration: `${duration}s`,
-      urlLength: RecordingUrl.length,
-      hasCallData: !!callData,
-    });
+    logger.info(`🚀 Starting SYNCHRONOUS processing for call: ${callId}`);
 
-    setImmediate(() => {
-      processRecordingAsync(callId, RecordingUrl, duration).catch((error) => {
-        logger.error(
-          `❌ Uncaught error in processRecordingAsync for ${callId}:`,
-          {
-            error: error.message,
-            errorType: error.constructor.name,
-            timestamp: new Date().toISOString(),
-          }
+    const result = await outboundManager.processRecording(
+      callId,
+      RecordingUrl,
+      RecordingDuration
+    );
+
+    // 🎯 ОБРАБАТЫВАЕМ РЕЗУЛЬТАТ И ВОЗВРАЩАЕМ TWIML
+    if (result && result.success) {
+      // ✅ ОБРАБОТКА УСПЕШНА
+      const audioData = outboundManager.pendingAudio.get(callId);
+
+      
+
+      if (audioData && audioData.audioUrl) {
+        logger.info(
+          `🎵 Processing successful, returning Play TwiML for ${callId}`
         );
-      });
-    });
 
-    logger.info(`🚀 Recording processing initiated for call: ${callId}`);
+        // Помечаем аудио как использованное
+        audioData.consumed = true;
+        outboundManager.pendingAudio.set(callId, audioData);
+
+        // Возвращаем готовый Play TwiML
+        const playTwiml = outboundManager.generatePlayTwiML(
+          callId,
+          audioData.audioUrl
+        );
+        return res.type('text/xml').send(playTwiml);
+      } else {
+        logger.warn(
+          `⚠️ Processing successful but no audio ready for ${callId}`
+        );
+      }
+    }
+
+    // ❌ ОБРАБОТКА ПРОВАЛИЛАСЬ ИЛИ НЕТ АУДИО - FALLBACK
+    logger.warn(`⚠️ Processing failed for ${callId}, using fallback`);
+
+    const fallbackTwiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Maxim" language="ru-RU">Извините, я не расслышал. Не могли бы вы повторить?</Say>
+    <Record 
+        action="${process.env.SERVER_URL}/api/webhooks/recording/${callId}"
+        method="POST"
+        maxLength="60"
+        playBeep="false"
+        timeout="3"
+        finishOnKey="#"
+        trim="trim-silence"
+        recordingStatusCallback="${process.env.SERVER_URL}/api/webhooks/recording-status/${callId}"
+    />
+</Response>`;
+
+    return res.type('text/xml').send(fallbackTwiml);
+
+    // logger.info(`✅ Recording validation passed for call: ${callId}`, {
+    //   duration: `${duration}s`,
+    //   urlLength: RecordingUrl.length,
+    //   hasCallData: !!callData,
+    // });
+
+    // setImmediate(() => {
+    //   processRecordingAsync(callId, RecordingUrl, duration).catch((error) => {
+    //     logger.error(
+    //       `❌ Uncaught error in processRecordingAsync for ${callId}:`,
+    //       {
+    //         error: error.message,
+    //         errorType: error.constructor.name,
+    //         timestamp: new Date().toISOString(),
+    //       }
+    //     );
+    //   });
+    // });
+
+    // logger.info(`🚀 Recording processing initiated for call: ${callId}`);
   } catch (error) {
     logger.error(`❌ Recording webhook error for call ${callId}:`, {
       error: error.message,
@@ -279,116 +336,116 @@ router.post('/recording/:callId', async (req, res) => {
 // АСИНХРОННАЯ ФУНКЦИЯ ОБРАБОТКИ ЗАПИСИ
 // =====================================================
 
-async function processRecordingAsync(callId, recordingUrl, duration) {
-  const processingStartTime = Date.now();
-  let retryCount = 0;
-  const maxRetries = 3;
-  let processingResult = null;
+// async function processRecordingAsync(callId, recordingUrl, duration) {
+//   const processingStartTime = Date.now();
+//   let retryCount = 0;
+//   const maxRetries = 3;
+//   let processingResult = null;
 
-  try {
-    // Установка маркера (ВАЖНО: сохраняем время)
-    outboundManager.recordingProcessing.set(callId, processingStartTime);
+//   try {
+//     // Установка маркера (ВАЖНО: сохраняем время)
+//     outboundManager.recordingProcessing.set(callId, processingStartTime);
 
-    while (retryCount < maxRetries) {
-      try {
-        logger.info(
-          `🧠 Starting enhanced AI processing for call: ${callId} (attempt ${retryCount + 1}/${maxRetries})`
-        );
+//     while (retryCount < maxRetries) {
+//       try {
+//         logger.info(
+//           `🧠 Starting enhanced AI processing for call: ${callId} (attempt ${retryCount + 1}/${maxRetries})`
+//         );
 
-        // 🔥 НОВЫЙ ВЫЗОВ с детекцией галлюцинаций
-        const result = await outboundManager.processRecording(
-          callId,
-          recordingUrl,
-          duration
-        );
+//         // 🔥 НОВЫЙ ВЫЗОВ с детекцией галлюцинаций
+//         const result = await outboundManager.processRecording(
+//           callId,
+//           recordingUrl,
+//           duration
+//         );
 
-        if (!result) {
-          logger.warn(`❌ No processing result for call: ${callId}`);
-          return;
-        }
+//         if (!result) {
+//           logger.warn(`❌ No processing result for call: ${callId}`);
+//           return;
+//         }
 
-        processingResult = result;
+//         processingResult = result;
 
-        logger.info(`✅ Enhanced processing completed for call: ${callId}`, {
-          classification: result.classification,
-          hasResponse: !!result.response,
-          nextStage: result.nextStage,
-          realSpeech: result.metadata?.realSpeech || false,
-          silenceType: result.metadata?.silenceType || 'none',
-          ignored: result.metadata?.ignored || false,
-        });
+//         logger.info(`✅ Enhanced processing completed for call: ${callId}`, {
+//           classification: result.classification,
+//           hasResponse: !!result.response,
+//           nextStage: result.nextStage,
+//           realSpeech: result.metadata?.realSpeech || false,
+//           silenceType: result.metadata?.silenceType || 'none',
+//           ignored: result.metadata?.ignored || false,
+//         });
 
-        // Continue conversation if needed
-        if (result.response && result.nextStage !== 'completed') {
-          logger.info(`🔄 Continuing conversation for call: ${callId}`);
-        } else if (result.metadata?.ignored) {
-          logger.info(`🔇 Ignored silence/hallucination for call: ${callId}`);
-        } else {
-          logger.info(`📞 Conversation completed for call: ${callId}`);
-        }
+//         // Continue conversation if needed
+//         if (result.response && result.nextStage !== 'completed') {
+//           logger.info(`🔄 Continuing conversation for call: ${callId}`);
+//         } else if (result.metadata?.ignored) {
+//           logger.info(`🔇 Ignored silence/hallucination for call: ${callId}`);
+//         } else {
+//           logger.info(`📞 Conversation completed for call: ${callId}`);
+//         }
 
-        break; // Успешно обработано
-      } catch (error) {
-        retryCount++;
-        logger.error(
-          `❌ Enhanced processing error for call ${callId} (attempt ${retryCount}/${maxRetries}):`,
-          {
-            error: error.message,
-            stack: error.stack?.split('\n')[0],
-            errorType: error.constructor.name,
-            recordingUrl: recordingUrl?.substring(0, 100) + '...',
-            recordingDuration: duration,
-            timestamp: new Date().toISOString(),
-          }
-        );
+//         break; // Успешно обработано
+//       } catch (error) {
+//         retryCount++;
+//         logger.error(
+//           `❌ Enhanced processing error for call ${callId} (attempt ${retryCount}/${maxRetries}):`,
+//           {
+//             error: error.message,
+//             stack: error.stack?.split('\n')[0],
+//             errorType: error.constructor.name,
+//             recordingUrl: recordingUrl?.substring(0, 100) + '...',
+//             recordingDuration: duration,
+//             timestamp: new Date().toISOString(),
+//           }
+//         );
 
-        if (retryCount >= maxRetries) {
-          logger.error(
-            `❌ Max retry attempts reached for call ${callId}, giving up`
-          );
-          break;
-        }
+//         if (retryCount >= maxRetries) {
+//           logger.error(
+//             `❌ Max retry attempts reached for call ${callId}, giving up`
+//           );
+//           break;
+//         }
 
-        // Пауза перед повторной попыткой
-        const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
-        logger.info(`⏳ Retrying in ${delay}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-  } catch (criticalError) {
-    logger.error(
-      `❌ Critical error in enhanced processRecordingAsync for call ${callId}:`,
-      {
-        error: criticalError.message,
-        errorType: criticalError.constructor.name,
-        timestamp: new Date().toISOString(),
-      }
-    );
-  } finally {
-    // ✅ ВСЕГДА УДАЛЯЕМ МАРКЕР
-    const startTime = outboundManager.recordingProcessing.get(callId);
-    const processingEndTime = Date.now();
+//         // Пауза перед повторной попыткой
+//         const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
+//         logger.info(`⏳ Retrying in ${delay}ms...`);
+//         await new Promise((resolve) => setTimeout(resolve, delay));
+//       }
+//     }
+//   } catch (criticalError) {
+//     logger.error(
+//       `❌ Critical error in enhanced processRecordingAsync for call ${callId}:`,
+//       {
+//         error: criticalError.message,
+//         errorType: criticalError.constructor.name,
+//         timestamp: new Date().toISOString(),
+//       }
+//     );
+//   } finally {
+//     // ✅ ВСЕГДА УДАЛЯЕМ МАРКЕР
+//     const startTime = outboundManager.recordingProcessing.get(callId);
+//     const processingEndTime = Date.now();
 
-    if (outboundManager.recordingProcessing.has(callId)) {
-      outboundManager.recordingProcessing.delete(callId);
-      logger.info(`✅ Removed processing marker for call: ${callId}`);
-    }
+//     if (outboundManager.recordingProcessing.has(callId)) {
+//       outboundManager.recordingProcessing.delete(callId);
+//       logger.info(`✅ Removed processing marker for call: ${callId}`);
+//     }
 
-    // ✅ ПРАВИЛЬНЫЙ РАСЧЕТ ВРЕМЕНИ
-    const totalProcessingTime = startTime ? processingEndTime - startTime : 0;
+//     // ✅ ПРАВИЛЬНЫЙ РАСЧЕТ ВРЕМЕНИ
+//     const totalProcessingTime = startTime ? processingEndTime - startTime : 0;
 
-    logger.info(`📊 Enhanced processing completed for call ${callId}:`, {
-      success: !!processingResult,
-      totalTime: `${totalProcessingTime}ms`,
-      retryAttempts: retryCount,
-      classification: processingResult?.classification || 'failed',
-      nextStage: processingResult?.nextStage || 'error',
-      realSpeech: processingResult?.metadata?.realSpeech || false,
-      whisperQuality:
-        processingResult?.metadata?.whisperAnalysis?.confidence || 0,
-    });
-  }
-}
+//     logger.info(`📊 Enhanced processing completed for call ${callId}:`, {
+//       success: !!processingResult,
+//       totalTime: `${totalProcessingTime}ms`,
+//       retryAttempts: retryCount,
+//       classification: processingResult?.classification || 'failed',
+//       nextStage: processingResult?.nextStage || 'error',
+//       realSpeech: processingResult?.metadata?.realSpeech || false,
+//       whisperQuality:
+//         processingResult?.metadata?.whisperAnalysis?.confidence || 0,
+//     });
+//   }
+// }
 
 // =====================================================
 // RECORDING STATUS WEBHOOK
